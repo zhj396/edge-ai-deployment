@@ -1,0 +1,109 @@
+# ====================== Project basics ======================
+project: yolov8_coco_subset
+experiment: yolov8s_12cls_staged
+
+data:
+  src: /kaggle/input/datasets/zhjing396/coco-subset/coco_subset_12cls
+  dst: /kaggle/working/coco_subset_12cls
+  yaml: /kaggle/working/coco_subset.yaml
+
+model:
+  base: yolov8s.pt
+  imgsz: 768
+
+# ====================== Training schedule ======================
+train:
+  device: [0]
+  batch: 16
+  workers: 8
+  multi_scale: 0.5  # ±50% size range; ultralytics >=8.4 reads this as a float
+                    # fraction — `true` would mean ±100% and shrink inputs to
+                    # stride size (1x1 feature maps -> BatchNorm crash)
+  patience: 50
+  save_period: 10
+
+  # Per-stage epochs
+  epochs:
+    A: 50
+    B: 100
+    C: 70
+
+# ====================== Per-stage parameters ======================
+stages:
+  A:  # Warm-up: strong augmentation + baseline loss gains
+    freeze: [0]                  # light freeze (stem)
+    box: 8.0
+    cls: 1.35
+    dfl: 1.3
+    mosaic: 0.90
+    mixup: 0.15
+    copy_paste: 0.35
+    hsv_s: 0.70
+    hsv_v: 0.40
+    degrees: 12.0
+    scale: 0.60
+    shear: 2.0
+
+  B:  # Main stage: introduce the custom class weights
+    freeze: []
+    box: 7.5
+    cls: 1.75
+    dfl: 1.7
+    mosaic: 0.85
+    mixup: 0.10
+    copy_paste: 0.28
+    hsv_s: 0.60
+    hsv_v: 0.38
+    degrees: 8.0
+    scale: 0.55
+    shear: 1.5
+
+  C:  # Refine: weak augmentation + strong classification
+    freeze: []
+    box: 7.0
+    cls: 2.10
+    dfl: 2.0
+    mosaic: 0.75
+    mixup: 0.05
+    copy_paste: 0.18
+    hsv_s: 0.50
+    hsv_v: 0.35
+    degrees: 5.0
+    scale: 0.50
+    shear: 1.0
+
+# ====================== Global optimizer parameters ======================
+optimizer:
+  name: AdamW
+  lr0: 0.0015
+  lrf: 0.01
+  weight_decay: 0.0005
+  cos_lr: True
+  warmup_epochs: 3.0
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+
+augment:  # Global defaults (overridden per stage)
+  hsv_h: 0.015
+  translate: 0.1
+  fliplr: 0.5
+
+# ====================== Misc ======================
+seed: 42
+deterministic: false
+val: True
+plots: True
+save: True
+exist_ok: True
+
+# W&B config (no-op unless the wandb package is installed)
+wandb:
+  enabled: True
+  project: yolov8_coco_subset
+  name: yolov8s_12cls_staged
+
+# Export config
+export:
+  formats: ["onnx", "engine"]
+  half: false
+  int8: false
