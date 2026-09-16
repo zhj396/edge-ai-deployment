@@ -325,10 +325,45 @@ val split).
 
 | Run | mAP50-95 | mAP50 | Precision | Recall | Notes |
 |-----|----------|-------|-----------|--------|-------|
-| baseline (`train_baseline.py`) | _pending_ | _pending_ | _pending_ | _pending_ | single-stage SGD |
-| staged, schedule-only (`train_staged/`, all stages `class_weights=None`) | _pending_ | _pending_ | _pending_ | _pending_ | ablation: A/B/C schedule without weighting |
-| staged + class weights (`train_staged/` as-is — weights on B/C) | _pending_ | _pending_ | _pending_ | _pending_ | the full recipe (§5) |
+| baseline (`train_baseline.py`) | **0.411** | **0.601** | 0.694 | **0.560** | single-stage SGD, train/eval imgsz 640, early-stopped at 161/200 epochs — **final checkpoint** |
+| staged, schedule-only (`train_staged/`, all stages `class_weights=None`) | — | — | — | — | not run — the A-vs-B/C contrast below already informs this project's decisions |
+| staged + class weights (`train_staged/` as-is — weights on B/C) | 0.370 | 0.549 | **0.708** | 0.506 | the full recipe (§5), train imgsz 768 / eval imgsz 640 (unified); row shows final stage C. Stage B peaked higher (0.380) — stage C regressed |
 
+Per-stage progression of the staged run (each stage's `best.pt`, re-evaluated at imgsz 640):
+
+| Stage          | Epochs | mAP50-95 | mAP50 | P     | R     |
+|----------------|--------|----------|-------|-------|-------|
+| A (unweighted) | 50     | 0.363    | 0.569 | 0.700 | 0.513 |
+| B (weighted)   | 100    | 0.380    | 0.556 | 0.650 | 0.522 |
+| C (weighted)   | 70     | 0.370    | 0.549 | 0.708 | 0.506 |
+
+**The headline: the staged long-tail recipe lost to the single-stage baseline —
+overall *and* on the tail classes it was designed to help.** At unified imgsz-640
+evaluation all four tail classes are better under baseline (mAP50-95, baseline vs
+staged C): backpack **0.420** vs 0.281, bicycle **0.390** vs 0.325, chair **0.204** vs
+0.141, bottle **0.153** vs 0.124. The class-weight injection worked mechanically (§5)
+but did not deliver the accuracy goal on this subset. The evaluation-resolution
+confound was eliminated by re-evaluating every checkpoint at 640 — the staged run's
+native 768 evaluation *flattered* it (C: 0.387 at 768 vs 0.370 at 640). This negative
+result is recorded deliberately, with the candidate explanations in the run log below.
+
+### Run log (2026-09, Kaggle Tesla T4 ×2)
+
+- Environment (`log_environment()`): ultralytics 8.4.114, torch 2.10.0+cu128,
+  numpy 2.0.2, CUDA available — matches the `train/requirements.txt` pins.
+- baseline: SGD lr0=0.008, imgsz 640, batch 16, 200-epoch cap with patience 80 →
+  early-stopped at 161 epochs.
+- staged: AdamW per `config.yaml`, imgsz 768; stages A/B/C = 50/100/70 epochs, all
+  ran to completion (no early stop). Class weights (inverse-frequency, power=0.7
+  smoothing) applied on B/C:
+  `[0.5625, 1.3763, 0.4397, 1.0507, 0.8775, 0.9835, 0.9342, 0.9368, 1.1059, 0.8971, 1.8902, 0.9455]`
+- **Final checkpoint** (deployed as `models/yolov8s.pt`): baseline `best.pt`,
+  21.5 MB, sha256 `523b21a075a67eccd06071a6313c49e6acb252677984e3ee02ebc8f9e265c5f6`.
+- Candidate explanations for the negative result (not separately ablated — a
+  controlled one-variable-at-a-time re-run is future work): train-time imgsz
+  differed alongside optimizer and schedule (768 staged vs 640 baseline);
+  power=0.7 weighting may over-boost a *moderate* tail (max/min ≈ 8); stage C's
+  regression hints at late-schedule overfitting.
 
 > ⚠️ Checkpoint coupling: the deployment-side results (the 7-backend benchmarks,
 > consistency runs, INT8 calibration) all derive from the checkpoint staged as
