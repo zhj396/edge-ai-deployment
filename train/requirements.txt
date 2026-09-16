@@ -1,0 +1,17 @@
+# Shared dependency set for everything under train/ (train_baseline.py and
+# train_staged/) — provision Kaggle notebooks with:
+#   pip install -r train/requirements.txt
+# Do NOT `pip install -U ultralytics`: the exact pin below is the release the
+# training pipeline is validated against (docs/TRAINING.md §5);
+# train_staged/utils.py::log_environment warns on drift at startup.
+#
+# ultralytics 8.4.114 REQUIRED: train_staged/trainer.py injects per-class
+# weights through the native `class_weights` model attribute that
+# v8DetectionLoss.__init__ reads (earlier 8.x releases have no such hook), and
+# the fractional `multi_scale` semantics in config.yaml assume >= 8.4.
+ultralytics==8.4.114
+PyYAML>=6.0
+numpy>=1.21
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
