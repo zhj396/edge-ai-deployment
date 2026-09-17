@@ -5,6 +5,7 @@ Subcommands
 * ``export``      — PyTorch .pt -> ONNX FP32
 * ``inspect``     — print ONNX model metadata (sha256, opset, shapes)
 * ``quantize``    — ONNX FP32 -> ONNX INT8 (static PTQ)
+* ``infer``       — batch inference + visualization
 
 All commands share the same top-level ``--log-level`` flag.
 """
@@ -12,7 +13,7 @@ import argparse
 import logging
 import sys
 
-from cli import export, inspect, quantize
+from cli import export, infer, inspect, quantize
 from src import __version__ as PACKAGE_VERSION
 from utils import get_logger, setup_logging, suppress_third_party_logs
 
@@ -23,6 +24,7 @@ COMMANDS = {
     "export": export,
     "inspect": inspect,
     "quantize": quantize,
+    "infer": infer,
 }
 
 
