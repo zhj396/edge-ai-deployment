@@ -5,6 +5,7 @@ Subcommands
 * ``export``      — PyTorch .pt -> ONNX FP32
 * ``inspect``     — print ONNX model metadata (sha256, opset, shapes)
 * ``quantize``    — ONNX FP32 -> ONNX INT8 (static PTQ)
+* ``consistency`` — compare two models (tensor- or detection-level)
 * ``infer``       — batch inference + visualization
 
 All commands share the same top-level ``--log-level`` flag.
@@ -13,7 +14,7 @@ import argparse
 import logging
 import sys
 
-from cli import export, infer, inspect, quantize
+from cli import consistency, export, infer, inspect, quantize
 from src import __version__ as PACKAGE_VERSION
 from utils import get_logger, setup_logging, suppress_third_party_logs
 
@@ -25,6 +26,7 @@ COMMANDS = {
     "inspect": inspect,
     "quantize": quantize,
     "infer": infer,
+    "consistency": consistency,
 }
 
 
@@ -71,8 +73,9 @@ def main() -> int:
 
     try:
         rc = COMMANDS[args.command].run(args)
-        # Subcommands may return an int exit code; None means success (run()
-        # implementations that don't return a value exit 0).
+        # Subcommands may return an int exit code (e.g. consistency returns non-zero
+        # when overall_pass is False); None means success (run() implementations
+        # that don't return a value exit 0).
         return int(rc) if isinstance(rc, int) else 0
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
