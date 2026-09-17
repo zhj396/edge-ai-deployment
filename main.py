@@ -7,6 +7,7 @@ Subcommands
 * ``quantize``    — ONNX FP32 -> ONNX INT8 (static PTQ)
 * ``consistency`` — compare two models (tensor- or detection-level)
 * ``infer``       — batch inference + visualization
+* ``benchmark``   — latency / throughput / memory / mAP
 
 All commands share the same top-level ``--log-level`` flag.
 """
@@ -14,7 +15,7 @@ import argparse
 import logging
 import sys
 
-from cli import consistency, export, infer, inspect, quantize
+from cli import benchmark, consistency, export, infer, inspect, quantize
 from src import __version__ as PACKAGE_VERSION
 from utils import get_logger, setup_logging, suppress_third_party_logs
 
@@ -27,6 +28,7 @@ COMMANDS = {
     "quantize": quantize,
     "infer": infer,
     "consistency": consistency,
+    "benchmark": benchmark,
 }
 
 
