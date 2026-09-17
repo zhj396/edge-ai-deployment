@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# clean.sh
+# Remove generated files and build artifacts.
+# Usage:
+#   ./clean.sh
+
+set -euo pipefail
+
+# _clean_find — run a find rooted at `.`, pruning the venv / .git dirs so we don't descend into them (otherwise we'd wipe the venv's own __pycache__ / .pyc, or delete stray .onnx inside site-packages).
+#
+# We use `-exec rm` rather than `-delete`: GNU find refuses `-delete` together with `-prune` because `-delete` implies `-depth` and `-depth` makes `-prune` a no-op (it errors out, which `2>/dev/null` would otherwise hide — leaving nothing deleted). `-exec rm` has no such conflict.
+_clean_find() {
+    find . \( -path ./.venv -o -path ./venv -o -path ./.git \) -prune \
+        -o "$@" 2>/dev/null || true
+}
+
+echo "Cleaning project artifacts..."
+
+# ---------------------------------------------------------------------------
+# Model artifacts (generated; inputs like *.pt / *.pth are NOT touched)
+# ---------------------------------------------------------------------------
+_clean_find -type f \( -name "*.onnx" -o -name "*.cache" \) -print -exec rm -f {} +
+
+# ---------------------------------------------------------------------------
+# Orphaned atomic-write temps (e.g. consistency_report.json.tmp left behind by a SIGKILL mid-write). .gitignore hides these, so without this line they accumulate invisibly.
+# ---------------------------------------------------------------------------
+_clean_find -type f -name "*.tmp" -print -exec rm -f {} +
+
+# ---------------------------------------------------------------------------
+# Python cache files
+# ---------------------------------------------------------------------------
+_clean_find -type f \( -name "*.pyc" -o -name "*.pyo" \) -print -exec rm -f {} +
+_clean_find -type d -name "__pycache__" -print -exec rm -rf {} +
+
+# ---------------------------------------------------------------------------
+# pytest cache files
+# ---------------------------------------------------------------------------
+_clean_find -type d -name ".pytest_cache" -print -exec rm -rf {} +
+
+# ---------------------------------------------------------------------------
+# Runtime outputs
+# ---------------------------------------------------------------------------
+rm -rf logs
+rm -rf results
+rm -rf runs
+
+echo "Clean complete."

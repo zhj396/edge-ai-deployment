@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# CPU-only build. Uses +cpu wheels from the PyTorch index (small, no CUDA libs).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
+onnxruntime==1.26.0

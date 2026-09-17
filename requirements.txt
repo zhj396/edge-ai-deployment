@@ -1,0 +1,22 @@
+# Core runtime dependencies (shared by CPU and GPU builds)
+# Pinned for reproducibility. Bump deliberately and re-validate.
+
+# --- ML / inference runtime ---
+ultralytics==8.4.114        # YOLO training / export / utils
+onnx==1.16.1                # model load / shape inference (export, inspect, quantize)
+opencv-python==4.10.0.84
+numpy==1.26.4               # pin <2.0 to avoid ABI churn across the stack
+tqdm==4.66.4
+pillow==12.3.0
+pandas==2.2.2
+psutil==5.9.8               # RSS measurement (benchmark) — also pulled by ultralytics
+pyyaml==6.0.1               # data.yaml parsing (sampler) — also pulled by ultralytics
+
+# --- Development & Testing ---
+black==24.4.2
+isort==5.13.2
+flake8==7.1.0
+pytest==8.3.2
+pytest-cov==5.0.0
+imagehash==4.3.1
+ml_dtypes==0.5.4
