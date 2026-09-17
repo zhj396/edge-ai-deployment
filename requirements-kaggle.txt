@@ -1,0 +1,42 @@
+# Kaggle T4 / GPU-notebook dependency set — for environments that already ship a
+# CUDA-enabled torch build (Kaggle's image carries torch 2.x+cu128):
+#   pip install -r requirements-kaggle.txt
+#
+# Differences from the local pin set (requirements.txt / requirements-cpu.txt),
+# all deliberate so this overlay composes with the base image instead of fighting it:
+# * torch is NOT installed here — the preinstalled CUDA build already drives the GPU.
+# * numpy is deliberately NOT pinned — the base image's numpy 2.x is supported by
+#   every package below (ultralytics 8.4.114, onnx 1.16.1, opencv 4.10, pandas 2.2.2,
+#   ml_dtypes 0.5.4).
+# * tqdm / pillow / pyyaml are NOT pinned — they are ultralytics' transitive deps and
+#   the base image already carries compatible versions; leaving them unpinned lets
+#   pip keep the preinstalled ones.
+#
+# onnxruntime-gpu==1.26.0 is the last CUDA-12 build (1.27.0+ ships CUDA-13
+# nvidia-cuda-* wheels, which clash with a CUDA-12.x runtime in one process), and
+# 1.21.0+ is the minimum that exposes the calibration_providers kwarg used in
+# src/quantize.py.
+
+# --- Project runtime deps (functional mirror of requirements.txt, minus the
+# --- pins called out above) ---
+ultralytics==8.4.114
+onnx==1.16.1
+opencv-python==4.10.0.84
+# numpy: deliberately NOT pinned here — keep the base image's numpy 2.x.
+pandas==2.2.2
+psutil==5.9.8
+# imagehash is a DIRECT dep (src/sampler.py::phash) — not transitive, so it must
+# stay listed. 4.3.2 matches the Kaggle base image / ydata-profiling; phash is
+# API-stable across the patch bump.
+imagehash==4.3.2
+ml_dtypes==0.5.4
+
+# --- Dev / test (drop these lines if you only need infer/benchmark) ---
+black==24.4.2
+isort==5.13.2
+flake8==7.1.0
+pytest==8.3.2
+pytest-cov==5.0.0
+
+# --- ONNX Runtime GPU ---
+onnxruntime-gpu==1.26.0
