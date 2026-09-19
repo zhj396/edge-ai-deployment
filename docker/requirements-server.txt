@@ -1,0 +1,14 @@
+# Web layer only for the FastAPI inference server.
+#
+# The inference stack itself (torch / onnx / onnxruntime / ultralytics / opencv
+# / numpy / pandas / psutil / pyyaml / pillow ...) comes from requirements-cpu.txt,
+# which the Dockerfile installs alongside this file. Reusing that overlay keeps
+# the server on the exact pinned stack the CLI is tested against — a hand-pinned
+# "lean" set would drop ultralytics (post_process imports ultralytics.utils.nms
+# for NMS) and risks numpy ABI drift. See docker/Dockerfile.server.
+#
+# Only the web deps live here. Pinned for reproducible builds.
+fastapi==0.110.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.9
+pydantic==2.6.0

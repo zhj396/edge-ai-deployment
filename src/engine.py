@@ -24,7 +24,7 @@ from torch.utils.dlpack import to_dlpack
 from ultralytics import YOLO
 
 from utils import get_logger, load_images, save_annotated_image, select_providers
-from . import post_process, preprocess_imgs
+from . import post_process, preprocess_imgs, preprocess_frames
 
 logger = get_logger(__name__)
 
@@ -249,6 +249,65 @@ class YOLOv8Engine:
         self.session.run_with_iobinding(io_binding)
         return io_binding.copy_outputs_to_cpu()
 
+    # run one preprocessed batch through forward + post_process
+    def _run_batch(
+        self,
+        data: Dict,
+        conf: float,
+        iou: float,
+        max_det: int,
+        save: bool,
+        output_dir: Path,
+    ) -> List[List[tuple]]:
+        """Forward + post_process on one preprocessed batch.
+
+        Shared by ``infer`` (file-backed) and ``infer_frames`` (array-backed) so
+        the deployed CLI path and the server hot path cannot drift apart — both
+        feed identical preprocessed dicts into the same forward/post pipeline.
+        """
+        outputs = self._forward(data["images"])
+        logger.debug("Backend=%s output type=%s shape=%s dtype=%s",
+                     self.backend, type(outputs), getattr(outputs, "shape", None),
+                     getattr(outputs, "dtype", None))
+        # PT forward returns a torch.Tensor; ONNX session.run returns a list of
+        # output arrays (single output here). post_process accepts this exact
+        # union (it takes outputs[0] for list/tuple) — keep the guard aligned
+        # with its signature so an unexpected backend change surfaces as a
+        # clear error here instead of a deep TypeError inside post_process.
+        assert isinstance(outputs, (np.ndarray, torch.Tensor, list, tuple)), (
+            f"unexpected output type {type(outputs)} for backend {self.backend}"
+        )
+        batch_dets = post_process(
+            outputs=outputs,
+            orig_shapes=data["orig_shapes"],
+            conf_thres=conf,
+            iou_thres=iou,
+            imgsz=self.imgsz,
+            max_det=max_det,
+            ratios=data["ratios"],
+            pads=data["pads"],
+            # Explicit nc so NMS splits box/cls channels authoritatively instead of
+            # re-inferring from the layout heuristic — the deployed path shouldn't depend
+            # on a magnitude heuristic (see src/postprocess._ensure_4nc_first).
+            nc=len(self.class_names) if self.class_names else None,
+        )
+
+        if save:
+            for j, dets in enumerate(batch_dets):
+                if not dets:
+                    continue
+                # preprocess_single stores paths as strings (see src/preprocess.py);
+                # preprocess_frames stores synthetic "<frame:N>" paths. Mirrors
+                # src/consistency.py which does Path(p).name on the same list.
+                save_path = output_dir / f"result_{Path(data['paths'][j]).name}"
+                save_annotated_image(
+                    orig_img=data["orig_imgs"][j],
+                    detections=dets,
+                    save_path=str(save_path),
+                    class_names=self.class_names,
+                )
+        return batch_dets
+
     # infer
     def infer(
         self,
@@ -280,31 +339,10 @@ class YOLOv8Engine:
                     device=self.device,
                     original=save,
                 )
-                outputs = self._forward(data["images"])
-                batch_dets = post_process(
-                    outputs=outputs,
-                    orig_shapes=data["orig_shapes"],
-                    conf_thres=conf,
-                    iou_thres=iou,
-                    imgsz=self.imgsz,
-                    max_det=max_det,
-                    ratios=data["ratios"],
-                    pads=data["pads"],
+                batch_dets = self._run_batch(
+                    data, conf=conf, iou=iou, max_det=max_det,
+                    save=save, output_dir=output_dir,
                 )
-
-                if save:
-                    for j, dets in enumerate(batch_dets):
-                        if not dets:
-                            continue
-                        # preprocess_single stores paths as strings (see src/preprocess.py).
-                        save_path = output_dir / f"result_{Path(data['paths'][j]).name}"
-                        save_annotated_image(
-                            orig_img=data["orig_imgs"][j],
-                            detections=dets,
-                            save_path=str(save_path),
-                            class_names=self.class_names,
-                        )
-
                 all_results.extend(batch_dets)
                 logger.info(
                     "Batch %d | Detections: %d",
@@ -314,3 +352,34 @@ class YOLOv8Engine:
             except Exception:
                 logger.exception("Batch inference failed (paths=%s)", batch_paths)
         return all_results
+
+    # infer from in-memory BGR frames (no file I/O) — server hot path
+    def infer_frames(
+        self,
+        frames: List[np.ndarray],
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int = 300,
+        save: bool = False,
+        output_dir: Union[str, Path] = "results/predictions",
+    ) -> List[List[tuple]]:
+        """Inference from already-decoded BGR frames.
+
+        The server hot path: a decoded frame (e.g. from ``cv2.imdecode`` of an
+        upload) is preprocessed via ``preprocess_frames`` and run through the
+        same ``_run_batch`` pipeline as the CLI's ``infer``. Skipping the
+        ``imwrite`` -> ``load_images`` round-trip keeps request latency off disk
+        and lets the server run fully in memory.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        data = preprocess_frames(
+            frames,
+            imgsz=self.imgsz,
+            device=self.device,
+            original=save,
+        )
+        return self._run_batch(
+            data, conf=conf, iou=iou, max_det=max_det,
+            save=save, output_dir=output_dir,
+        )

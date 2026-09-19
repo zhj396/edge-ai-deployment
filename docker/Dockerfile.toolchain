@@ -1,0 +1,69 @@
+# =============================================================================
+# YOLOv8s ONNX Runtime Toolchain Image (CPU)
+# =============================================================================
+# Build:
+#   docker build -f docker/Dockerfile.toolchain -t yolov8s-ort:toolchain .
+#
+# Run (example: benchmark):
+#   docker run --rm -v $(pwd)/models:/app/models \
+#                  -v $(pwd)/data:/app/data \
+#                  -v $(pwd)/results:/app/results \
+#                  yolov8s-ort:toolchain \
+#                  python main.py benchmark \
+#                      --model onnx_fp32:models/yolov8s_fp32.onnx \
+#                      --imgs-input data --max-images 16 --batch-size 1
+# =============================================================================
+#
+# Why requirements-cpu.txt and not requirements.txt alone: the project's
+# requirements.txt deliberately omits torch and onnxruntime (it is shared
+# between the CPU and GPU overlays — see CLAUDE.md). Installing it alone makes
+# `import torch` fail at every CLI command. requirements-cpu.txt is the overlay
+# that adds the pinned +cpu torch and onnxruntime wheels.
+# =============================================================================
+
+FROM python:3.11-slim AS base
+
+# Disable interactive prompts and Python bytecode
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# OS-level deps: OpenCV needs libgl/libglib; git keeps the dev workflow usable.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgl1 \
+        libglib2.0-0 \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ---- 1. dependencies layer (cached unless requirements change) --------------
+# requirements-cpu.txt pulls in requirements.txt (ultralytics / onnx / opencv /
+# numpy / pandas / psutil / dev tools) and adds torch==2.5.1+cpu,
+# onnxruntime==1.26.0, torchvision==0.20.1+cpu from the CPU index.
+COPY requirements.txt requirements-cpu.txt ./
+RUN pip install --no-cache-dir -r requirements-cpu.txt
+
+# ---- 2. source layer (rebuilt on every code change) -------------------------
+COPY main.py ./
+COPY cli/ ./cli/
+COPY src/ ./src/
+COPY utils/ ./utils/
+
+# models/ and data/ are bind-mounted at runtime, not baked in. .dockerignore
+# excludes models/*.pt and *.onnx from the build context anyway. We only ensure
+# the mountpoint exists. The .config dirs are pre-created so ultralytics /
+# matplotlib find a writable config location on first import instead of
+# falling back to /tmp with a warning on every boot.
+RUN mkdir -p models data results /root/.config/Ultralytics /root/.config/matplotlib
+
+# Make `python -m src` / `from src import ...` work without install
+ENV PYTHONPATH=/app
+
+# Default: show help. Override with `docker run ... <args>` or
+# `docker compose run toolchain <args>`.
+CMD ["python", "main.py", "--help"]

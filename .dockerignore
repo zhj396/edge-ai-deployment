@@ -1,0 +1,41 @@
+# .dockerignore — keep the build context small and reproducible
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Large / generated artifacts
+models/*.pt
+models/*.onnx
+models/*.pth
+data/
+results/
+logs/
+*.log
+*.tmp
+*.zip
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tests (not needed in runtime image)
+tests/
+
+# Docs (not needed in runtime image)
+docs/
+*.md
+LICENSE
+
+# Docker itself
+Dockerfile*
+.dockerignore

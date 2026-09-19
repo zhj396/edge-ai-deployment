@@ -1,0 +1,104 @@
+# =============================================================================
+# YOLOv8s Inference Server Image (CPU)
+# =============================================================================
+# Multi-stage build: builder installs the full CPU stack + web layer; runtime
+# only carries compiled wheels (no compiler, no build headers).
+#
+# Build:
+#   docker build -f docker/Dockerfile.server -t yolov8s-ort:server .
+#
+# Run:
+#   docker run --rm -p 8000:8000 \
+#                  -v $(pwd)/models:/app/models:ro \
+#                  -e MODEL_PATH=/app/models/yolov8s_int8.onnx \
+#                  -e BACKEND=onnx_int8 \
+#                  yolov8s-ort:server
+# =============================================================================
+#
+# Why the server reuses requirements-cpu.txt instead of a hand-pinned lean set:
+# the server's import graph transitively requires ultralytics (post_process
+# imports ultralytics.utils.nms for NMS) and onnx (utils.model_utils). A
+# "lean server without ultralytics" would mean reimplementing NMS — high risk
+# for zero correctness gain. So the server carries the project's tested,
+# pinned CPU stack verbatim and only adds the thin FastAPI web layer
+# (docker/requirements-server.txt). The multi-stage build still strips the
+# compiler (gcc / build-essential) from the runtime image.
+# =============================================================================
+
+# ---- builder stage ----------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Install the tested CPU stack + the web layer. requirements-cpu.txt carries
+# the +cu-less torch wheel via --extra-index-url .../whl/cpu.
+COPY requirements.txt requirements-cpu.txt docker/requirements-server.txt ./
+RUN pip install --no-cache-dir -r requirements-cpu.txt -r requirements-server.txt
+
+# ---- runtime stage ----------------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    LOG_FILE=/app/logs/server.log
+
+# OpenCV runtime libs only (no build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libgl1 \
+        libglib2.0-0 \
+        curl \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for the runtime. Pre-create the home + .config cache dirs
+# (matplotlib, ultralytics — both pulled transitively) owned by app, so their
+# writability checks pass on the *first* import (ultralytics inits during
+# `from src import YOLOv8Engine`, before anything else would mkdir .config).
+# Without this both emit noisy "not writable, using /tmp" warnings every boot.
+RUN groupadd -r app && useradd -r -g app -u 1000 -m app && \
+    mkdir -p /home/app/.config/Ultralytics /home/app/.config/matplotlib && \
+    chown -R app:app /home/app
+
+ENV HOME=/home/app
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy only what the server needs at runtime
+COPY main.py ./
+COPY cli/ ./cli/
+COPY src/ ./src/
+COPY utils/ ./utils/
+COPY docker/ ./docker/
+
+# Models are mounted at runtime via -v, but set up the default dirs and make
+# them writable by the non-root app user (covers the bare `docker run` case
+# where logs/ is not bind-mounted).
+RUN mkdir -p /app/models /app/logs && chown -R app:app /app
+USER app
+
+# Healthcheck hits the FastAPI healthz endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8000/healthz || exit 1
+
+# tini gives us proper SIGTERM forwarding — fastapi/uvicorn handle shutdown cleanly
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["uvicorn", "docker.server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+EXPOSE 8000
