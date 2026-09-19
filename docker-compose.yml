@@ -1,0 +1,53 @@
+# docker-compose.yml — local dev convenience, NOT for production
+#
+# Usage:
+#   docker compose up server       # start inference server on :8000
+#   docker compose run toolchain <args>   # one-off CLI invocation, e.g.
+#        docker compose run toolchain python main.py benchmark --model onnx_fp32:models/yolov8s_fp32.onnx ...
+#
+# Edit the volumes below to point at your local models/ and data/ directories.
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    image: yolov8s-ort:server
+    container_name: yolov8s-server
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /app/models/yolov8s_int8.onnx
+      BACKEND: onnx_int8
+      IMGSZ: "640"
+      CONF_THRESHOLD: "0.25"
+      IOU_THRESHOLD: "0.45"
+      LOG_LEVEL: "20"
+      # Leave RELOAD_TOKEN empty to disable /reload (403). Set a value to
+      # enable authenticated hot model-swaps via `X-Reload-Token`.
+      RELOAD_TOKEN: ""
+    volumes:
+      - ./models:/app/models:ro
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  toolchain:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.toolchain
+    image: yolov8s-ort:toolchain
+    container_name: yolov8s-toolchain
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./results:/app/results
+      - ./logs:/app/logs
+    # `command` (not entrypoint) so `docker compose run toolchain <args>`
+    # replaces the default cleanly instead of appending to a fixed entrypoint.
+    command: ["python", "main.py", "--help"]

@@ -3,7 +3,7 @@ Validation
 
 [![CI](https://github.com/zhj396/edge-ai-deployment/actions/workflows/ci.yml/badge.svg)](https://github.com/zhj396/edge-ai-deployment/actions/workflows/ci.yml)
 
-A Python toolchain for taking a **YOLOv8s** PyTorch checkpoint through the full
+A production-oriented Python toolchain for taking a **YOLOv8s** PyTorch checkpoint through the full
 edge-deployment lifecycle: **export → ONNX Runtime inference → static INT8 quantization (QDQ /
 MinMax or Entropy) → consistency & accuracy validation → latency / throughput / memory / mAP
 benchmark**, all reproducible from a single CLI.
@@ -19,6 +19,9 @@ documented; benchmark figures are tracked in [docs/ARCHITECTURE.md
 > The upstream training half — COCO 12-class subset build, dataset analysis, and baseline vs. staged
 > long-tail training that produces `models/yolov8s.pt` — lives in [`train/`](train/) with the full
 > narrative in **[docs/TRAINING.md](docs/TRAINING.md)**.
+>
+> Docker packaging — a `toolchain` image (the full CLI) and a `server` image (FastAPI inference,
+> CPU) — is covered in **[docs/DOCKER.md](docs/DOCKER.md)**.
 
 ---
 
@@ -204,7 +207,7 @@ python main.py quantize --model models/yolov8s_fp32.onnx --output models/yolov8s
 # 5. Run inference on images and draw boxes
 python main.py infer --backend onnx_int8 --model models/yolov8s_int8.onnx --imgs-input data/images/val --output-dir results/predictions/onnx_int8
 
-# 6. Benchmark all backends, with optional mAP validation
+# 6. Benchmark all three backends, with optional mAP validation
 python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:models/yolov8s_fp32.onnx --model onnx_int8:models/yolov8s_int8.onnx --imgs-input data --validation --warmup 10 --runs 25
 ```
 
@@ -264,7 +267,7 @@ Benchmark
 
 ## Design & Engineering Notes
 
-The deliberate design decisions behind the toolkit. Each is
+The non-obvious decisions that distinguish a research script from a deployable toolkit. Each is
 documented **once** — with code refs, rationale, and measured numbers — in the [architecture
 deep-dive](docs/ARCHITECTURE.md):
 
