@@ -24,6 +24,7 @@ _LAZY: dict[str, str] = {
     "post_process": ".postprocess",
     "preprocess_single": ".preprocess",
     "preprocess_imgs": ".preprocess",
+    "preprocess_frames": ".preprocess",
     "CalibrationSampler": ".sampler",
     "model_export": ".export",
     "validate_consistency": ".consistency",

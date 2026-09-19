@@ -9,6 +9,8 @@ Built and validated end-to-end on a **local PC (13th Gen Intel Core i5-13420H)**
 > A full architecture deep-dive — pipeline, quantization policy, consistency gates, benchmarking — lives in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 >
 > The upstream training half — COCO 12-class subset build, dataset analysis, and baseline vs. staged long-tail training that produces `models/yolov8s.pt` — lives in [`train/`](train/) with the full narrative in **[docs/TRAINING.md](docs/TRAINING.md)**.
+>
+> Docker packaging — a `toolchain` image (the full CLI) and a `server` image (FastAPI inference, CPU) — is covered in **[docs/DOCKER.md](docs/DOCKER.md)**.
 
 ---
 

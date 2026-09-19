@@ -4,9 +4,18 @@ The pipeline is:
 
     Raw Image (HWC BGR) -> Letterbox -> BGR->RGB -> HWC->CHW -> /255 -> float32 NCHW
 
-Both single-image (``preprocess_single``) and batched (``preprocess_imgs``) APIs are exposed. The
-batched variant uses a ``ThreadPoolExecutor`` for the per-image cv2 work; the rest of the pipeline
-(numpy stack, ``torch.from_numpy``, normalization) is single- threaded and runs once per batch.
+Three entry points are exposed:
+
+* ``preprocess_single``   — file-backed, single image (``cv2.imread``).
+* ``preprocess_imgs``     — file-backed, batched (``ThreadPoolExecutor`` over
+  ``preprocess_single``); used by the CLI, benchmark, consistency, quantize.
+* ``preprocess_frames``   — array-backed, batched (already-decoded BGR frames);
+  used by the FastAPI inference server so a request never has to round-trip an
+  upload through disk (``imwrite`` -> ``imread``).
+
+The per-image work and the batch-tensor assembly are factored into
+``_preprocess_bgr`` and ``_assemble_batch`` so the file-backed and array-backed
+paths share the exact same numerics — they cannot drift apart.
 """
 from __future__ import annotations
 
@@ -94,6 +103,49 @@ def letterbox(
 
 
 # ---------------------------------------------------------------------------
+# Shared per-image core
+# ---------------------------------------------------------------------------
+def _preprocess_bgr(
+    img: np.ndarray,
+    imgsz: Union[int, Tuple[int, int]] = 640,
+    original: bool = False,
+    path: Optional[str] = None,
+) -> dict:
+    """Letterbox + reformat a decoded BGR image into a CHW uint8 array.
+
+    This is the shared core of ``preprocess_single`` (file-backed) and
+    ``preprocess_frames`` (array-backed). The caller is responsible for
+    decoding the image into a contiguous BGR HWC array and for deciding whether
+    it needs the original (un-letterboxed) copy for annotation.
+    """
+    # Normalize channel count: grayscale / BGRA -> BGR. The file-backed path
+    # gets this from cv2.imread's flags; the array-backed path may receive any.
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[-1] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    orig = img.copy() if original else None
+    orig_shape = img.shape[:2]
+
+    img, ratio, pad = letterbox(img, new_shape=imgsz)
+    pad_left = int(pad[0] / 2)
+    pad_top = int(pad[1] / 2)
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = np.ascontiguousarray(img.transpose(2, 0, 1))
+
+    return {
+        "img": img,
+        "orig_img": orig,
+        "orig_shape": orig_shape,
+        "ratio": ratio,                # (r_w, r_h)
+        "pad": (pad_left, pad_top),    # single-side padding
+        "path": path,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Single image
 # ---------------------------------------------------------------------------
 def preprocess_single(
@@ -107,34 +159,64 @@ def preprocess_single(
         img = cv2.imread(str(img_path))
         if img is None:
             raise RuntimeError(f"Cannot read image: {img_path}")
-
-        # Grayscale / BGRA -> BGR
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[-1] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-        orig = img.copy() if original else None
-        orig_shape = img.shape[:2]
-
-        img, ratio, pad = letterbox(img, new_shape=imgsz)
-        pad_left = int(pad[0] / 2)
-        pad_top = int(pad[1] / 2)
-
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = np.ascontiguousarray(img.transpose(2, 0, 1))
-
-        return {
-            "img": img,
-            "orig_img": orig,
-            "orig_shape": orig_shape,
-            "ratio": ratio,                # (r_w, r_h)
-            "pad": (pad_left, pad_top),    # single-side padding
-            "path": str(img_path),
-        }
+        return _preprocess_bgr(img, imgsz=imgsz, original=original, path=str(img_path))
     except Exception as e:
         logger.error("Preprocessing failed %s: %s", img_path, e, exc_info=False)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Shared batch assembly
+# ---------------------------------------------------------------------------
+def _assemble_batch(
+    results: List[dict],
+    device: str = "cpu",
+    fp16: bool = False,
+) -> Dict:
+    """Stack per-image dicts (from ``_preprocess_bgr``) into the batch dict.
+
+    Shared tail of ``preprocess_imgs`` (file-backed) and ``preprocess_frames``
+    (array-backed) so the two paths produce an identical batch structure —
+    the same ``_forward`` / ``post_process`` pipeline consumes either.
+    """
+    imgs = [r["img"] for r in results]
+    orig_imgs = [r["orig_img"] for r in results if r["orig_img"] is not None]
+    orig_shapes = [r["orig_shape"] for r in results]
+    ratios = [r["ratio"] for r in results]
+    pads = [r["pad"] for r in results]
+    paths = [r["path"] for r in results]
+
+    batch_np = np.stack(imgs, axis=0)  # (B, 3, H, W) uint8
+    tensor = torch.from_numpy(batch_np).to(torch.float32)
+
+    actual_device = device
+    if device == "cuda" and torch.cuda.is_available():
+        # pin_memory only meaningful for host tensors being copied to CUDA
+        tensor = tensor.pin_memory().to(device, non_blocking=True)
+    else:
+        actual_device = "cpu"
+
+    tensor /= 255.0  # normalize to [0, 1]
+
+    if fp16:
+        if actual_device == "cuda":
+            tensor = tensor.half()
+        else:
+            logger.warning("FP16 is ineffective on CPU; ignoring")
+
+    logger.debug(
+        "Preprocessing done | count=%d | shape=%s | dtype=%s | device=%s",
+        len(results), tuple(tensor.shape), tensor.dtype, actual_device,
+    )
+
+    return {
+        "images": tensor,
+        "orig_imgs": orig_imgs,
+        "orig_shapes": orig_shapes,
+        "ratios": ratios,
+        "pads": pads,
+        "paths": paths,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -193,42 +275,52 @@ def preprocess_imgs(
             len(img_paths) - len(valid), len(img_paths),
         )
 
-    # Assemble batch
-    imgs = [r["img"] for r in valid]
-    orig_imgs = [r["orig_img"] for r in valid] if original else []
-    orig_shapes = [r["orig_shape"] for r in valid]
-    ratios = [r["ratio"] for r in valid]
-    pads = [r["pad"] for r in valid]
-    paths = [r["path"] for r in valid]
+    return _assemble_batch(valid, device=device, fp16=fp16)
 
-    batch_np = np.stack(imgs, axis=0)  # (B, 3, H, W) uint8
-    tensor = torch.from_numpy(batch_np).to(torch.float32)
 
-    actual_device = device
-    if device == "cuda" and torch.cuda.is_available():
-        # pin_memory only meaningful for host tensors being copied to CUDA
-        tensor = tensor.pin_memory().to(device, non_blocking=True)
-    else:
-        actual_device = "cpu"
+# ---------------------------------------------------------------------------
+# Batched preprocessing (array-backed — inference server hot path)
+# ---------------------------------------------------------------------------
+def preprocess_frames(
+    frames: List[np.ndarray],
+    imgsz: Union[int, Tuple[int, int]] = 640,
+    device: str = "cpu",
+    original: bool = False,
+    disable_cv2_threading: bool = True,
+) -> Dict:
+    """Preprocess already-decoded BGR frames — no file I/O.
 
-    tensor /= 255.0  # normalize to [0, 1]
+    Used by the FastAPI inference server so a request never has to round-trip
+    the uploaded image through disk (``imwrite`` -> ``imread``), which the
+    file-backed ``preprocess_imgs`` would otherwise force. The output layout
+    is identical to ``preprocess_imgs`` so the same ``_forward`` /
+    ``post_process`` pipeline consumes it.
 
-    if fp16:
-        if actual_device == "cuda":
-            tensor = tensor.half()
-        else:
-            logger.warning("FP16 is ineffective on CPU; ignoring")
+    Unlike ``preprocess_imgs`` there is no per-frame error tolerance: a frame
+    ``_preprocess_bgr`` cannot convert (e.g. an array with an unsupported
+    channel count) raises. Callers hold the frames in memory, so silently
+    dropping one would desynchronize them from their results.
 
-    logger.debug(
-        "Preprocessing done | count=%d | shape=%s | dtype=%s | device=%s",
-        len(valid), tuple(tensor.shape), tensor.dtype, actual_device,
-    )
+    Parameters
+    ----------
+    disable_cv2_threading
+        If True, call ``cv2.setNumThreads(0)`` once before the loop — same
+        global, sticky setting as ``preprocess_imgs`` (see its docstring).
+    """
+    if not frames:
+        raise ValueError("Frame list cannot be empty")
 
-    return {
-        "images": tensor,
-        "orig_imgs": orig_imgs,
-        "orig_shapes": orig_shapes,
-        "ratios": ratios,
-        "pads": pads,
-        "paths": paths,
-    }
+    if disable_cv2_threading:
+        cv2.setNumThreads(0)
+
+    imgsz_t = check_imgsz(imgsz)
+    # Single request -> serial map is fine and avoids the thread-pool overhead
+    # for the common 1-frame case. ``path`` is synthetic; it only matters if a
+    # caller enables save= (the server does not). Keep the name free of ":" —
+    # the save path does Path(...).name on it, and ":" is illegal in Windows
+    # filenames (infer_frames(save=True) would fail there).
+    results = [
+        _preprocess_bgr(f, imgsz=imgsz_t, original=original, path=f"<frame_{i}>")
+        for i, f in enumerate(frames)
+    ]
+    return _assemble_batch(results, device=device, fp16=False)
