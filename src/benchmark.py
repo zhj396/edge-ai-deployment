@@ -285,9 +285,12 @@ class Benchmark:
             with torch.no_grad():
                 return model.model(pre["images"])
 
-        return self._timed_end_to_end(
+        metrics = self._timed_end_to_end(
             backend, model_path, batches, forward, baseline
         )
+        # Reproducibility (CLAUDE.md): record the device that actually ran.
+        metrics["device"] = str(self.device)
+        return metrics
 
     # onnx path
     def _run_onnx(self, backend: str, model_path: str) -> Dict:
@@ -308,9 +311,74 @@ class Benchmark:
             inp = self._prepare_onnx_input(pre["images"])
             return session.run(None, {input_name: inp})
 
-        return self._timed_end_to_end(
+        metrics = self._timed_end_to_end(
             backend, model_path, batches, forward, baseline
         )
+        # Reproducibility (CLAUDE.md): record the *actual* primary execution
+        # provider — ORT itself may have fallen back from the requested EP
+        # (e.g. CUDA unavailable -> CPU), so get_providers() is more honest
+        # than echoing self.device.
+        providers = session.get_providers()
+        metrics["device"] = providers[0] if providers else str(self.device)
+        return metrics
+
+    # openvino path
+    def _run_openvino(self, backend: str, model_path: str) -> Dict:
+        """OpenVINO IR / ONNX via the OpenVINO runtime.
+
+        The OpenVINO *device* (CPU / GPU / AUTO) is selected via the
+        ``OPENVINO_DEVICE`` env var, not ``--device`` — ``--device`` still
+        controls only where preprocess runs (and is irrelevant here: OpenVINO
+        takes host numpy, so we always preprocess on CPU). Mirrors the
+        ``_run_onnx`` shape: compile once, then the timed loop feeds the
+        shared preprocess -> forward -> post_process pipeline.
+        """
+        baseline = self._baseline_memory()
+
+        from . import OpenVINOEngine, openvino_available
+
+        if not openvino_available():
+            raise RuntimeError(
+                "OpenVINO not installed; run: pip install -r requirements-openvino.txt"
+            )
+        device = os.environ.get("OPENVINO_DEVICE", "CPU")
+        engine = OpenVINOEngine(
+            model_path=model_path, device=device, imgsz=self.imgsz,
+        )
+        # Cap to the model's per-forward batch: a static-batch IR (e.g. one
+        # converted from a static-batch ONNX) rejects batch>1 at the DFL
+        # reshape. The headline FPS/latency stay correct either way.
+        eff = engine._effective_batch(self.batch_size)
+
+        batches = list(self._build_batches(self.speed_imgs, eff))
+        if not batches:
+            raise RuntimeError("No images available for benchmarking")
+
+        def forward(pre: Dict):
+            return engine._forward(pre["images"].cpu().numpy())
+
+        metrics = self._timed_end_to_end(
+            backend, model_path, batches, forward, baseline
+        )
+        # Reproducibility (CLAUDE.md): record the device that *actually*
+        # executed, not the OPENVINO_DEVICE request. engine.device is the
+        # resolved value from validate_device_request's preflight — when an
+        # unservable request (e.g. GPU without an Intel GPU driver) fell
+        # back to CPU, the metrics must say CPU or the summary would
+        # advertise iGPU throughput measured on the host CPU. Keep the
+        # request alongside so the fallback stays visible in the results.
+        metrics["device"] = engine.device
+        if engine.device != device.upper():
+            metrics["requested_device"] = device.upper()
+        # When a static-batch IR capped eff below the requested --batch-size,
+        # "batch_size" must report what *actually* ran per forward (eff), not
+        # the requested value — otherwise the summary CSV advertises batched
+        # throughput that never happened (the static IR was sub-looped at
+        # its baked batch). Keep the requested value alongside for honesty.
+        if eff != self.batch_size:
+            metrics["requested_batch_size"] = self.batch_size
+            metrics["batch_size"] = eff
+        return metrics
 
     def _timed_end_to_end(
         self,
@@ -446,17 +514,32 @@ class Benchmark:
 
             if backend == "pytorch":
                 speed = self._run_pytorch(backend, model_path)
+            elif backend.startswith("openvino"):
+                speed = self._run_openvino(backend, model_path)
             else:
                 speed = self._run_onnx(backend, model_path)
 
             if self.validation:
-                val_model = YOLO(model_path, task='detect')
-                self._compute_map(val_model, backend)
+                if backend.startswith("openvino"):
+                    # Ultralytics' YOLO() can load its own OpenVINO export
+                    # (an openvino_model/ folder) but not a raw .xml produced
+                    # by our converter — it lacks the ultralytics metadata.
+                    # Skip rather than crash; run validation on the .pt if mAP
+                    # is needed.
+                    logger.warning(
+                        "mAP validation skipped for %s (raw OpenVINO IR not "
+                        "loadable by Ultralytics YOLO; validate the .pt instead)",
+                        backend,
+                    )
+                else:
+                    val_model = YOLO(model_path, task='detect')
+                    self._compute_map(val_model, backend)
 
             results.append(speed)
             summary_rows.append([
                 os.path.basename(model_path),
                 backend,
+                speed.get("device", ""),
                 speed["batch_size"],
                 speed["mean_total_s"],
                 speed["mean_batch_s"],
@@ -471,7 +554,7 @@ class Benchmark:
             ])
 
         summary_df = pd.DataFrame(summary_rows, columns=[
-            "Model", "Backend", "BatchSize", "Total_s", "Batch_s",
+            "Model", "Backend", "Device", "BatchSize", "Total_s", "Batch_s",
             "Image_s", "FPS", "Latency_ms_mean", "p50_ms", "p95_ms",
             "p99_ms", "Peak_Memory_MB", "RSS_Increase_MB",
         ])

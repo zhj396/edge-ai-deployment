@@ -78,3 +78,39 @@ class ConsistencyConfig:
     atol: float
     rtol: float
     report_path: Path
+
+
+@dataclass
+class OpenVINOConvertConfig:
+    model: Path
+    output: Path
+    imgsz: int
+    fp16: bool
+
+
+@dataclass
+class OpenVINOQuantizeConfig:
+    model: Path
+    output: Path
+    imgs_input: Path
+    imgsz: int
+    max_cal_samples: int
+    subset_size: int
+    resnet50: Optional[Path]
+    smooth_quant: bool
+
+
+@dataclass
+class OpenVINORunConfig:
+    model: Path
+    imgs_input: Path
+    imgsz: int
+    device: str
+    num_streams: str
+    max_imgs: int
+    batch_size: int
+    conf: float
+    iou: float
+    output_dir: Path
+    # Optional: data.yaml for class names (IR has no ultralytics names meta).
+    data_yaml: Optional[Path] = None

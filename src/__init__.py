@@ -31,6 +31,14 @@ _LAZY: dict[str, str] = {
     "quantize_onnx_to_int8": ".quantize",
     "YOLOv8Engine": ".engine",
     "Benchmark": ".benchmark",
+    # OpenVINO backend (optional — openvino/nncf not in the base pin set)
+    "convert_onnx_to_openvino_ir": ".openvino_convert",
+    "nncf_quantize_openvino": ".openvino_convert",
+    "openvino_conversion_available": ".openvino_convert",
+    "nncf_available": ".openvino_convert",
+    "OpenVINOEngine": ".openvino_engine",
+    "OpenVINOAsyncEngine": ".openvino_engine",
+    "openvino_available": ".openvino_engine",
 }
 
 __all__ = list(_LAZY)

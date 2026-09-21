@@ -141,6 +141,17 @@ def test_path_validation_error_is_visible_to_argparse():
     assert issubclass(PathValidationError, ValueError)
 
 
+def test_existing_validation_accepts_openvino_ir(tmp_path):
+    # OpenVINO IR comes as .xml + sibling .bin; both must validate so the
+    # `openvino run --model` path isn't rejected as an "unsupported format".
+    xml = tmp_path / "y.xml"
+    binf = tmp_path / "y.bin"
+    xml.write_text("<net/>")
+    binf.write_bytes(b"\0" * 4)
+    assert existing_validation(xml) == xml
+    assert existing_validation(binf) == binf
+
+
 # ---------------------------------------------------------------------------
 def test_sha256_of_file(tmp_path):
     f = tmp_path / "f.bin"

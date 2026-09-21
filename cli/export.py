@@ -6,6 +6,33 @@ from src import model_export
 
 logger = get_logger(__name__)
 
+# Opset default shared with the ``openvino convert`` ONNX-missing fallback
+# (cli/openvino.py), so the auto-export behaves exactly like
+# ``python main.py export``.
+DEFAULT_OPSET = 17
+
+
+def export_model(cfg):
+    """Run the export workflow from a populated :class:`ExportConfig`.
+
+    Shared by the ``export`` command and the ``openvino convert``
+    auto-export fallback, so there is exactly one definition of what a
+    default export does.
+    """
+    logger.info(f"Exporting {cfg.model} -> {cfg.output}")
+    model_export(
+        model_path=cfg.model,
+        output_path=cfg.output,
+        imgsz=cfg.imgsz,
+        opset=cfg.opset,
+        dynamic=cfg.dynamic,
+        simplify=cfg.simplify,
+        device=cfg.device,
+        nms=cfg.nms,
+        validate=cfg.validate,
+    )
+    logger.info("Export complete")
+
 
 # =========================================================
 # Add CLI subparser
@@ -25,7 +52,7 @@ def add_parser(subparsers):
     )
     parser.add_argument("--output", type=Path, default="models/yolov8s_fp32.onnx")
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--opset", type=int, default=DEFAULT_OPSET)
     parser.add_argument("--no-dynamic", action="store_true")
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument(
@@ -53,16 +80,4 @@ def run(args):
         nms=args.nms,
         validate=not args.no_validate,
     )
-    logger.info(f"Exporting {cfg.model} -> {cfg.output}")
-    model_export(
-        model_path=cfg.model,
-        output_path=cfg.output,
-        imgsz=cfg.imgsz,
-        opset=cfg.opset,
-        dynamic=cfg.dynamic,
-        simplify=cfg.simplify,
-        device=cfg.device,
-        nms=cfg.nms,
-        validate=cfg.validate,
-    )
-    logger.info("Export complete")
+    export_model(cfg)

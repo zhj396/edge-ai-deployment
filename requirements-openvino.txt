@@ -1,0 +1,20 @@
+# OpenVINO backend — optional. Install ON TOP OF requirements-cpu.txt
+# (or requirements-gpu.txt). OpenVINO is an Intel-CPU/iGPU/VPU runtime that
+# complements ONNX Runtime; it is NOT a drop-in replacement for torch/ort.
+#
+#   pip install -r requirements-cpu.txt
+#   pip install -r requirements-openvino.txt
+#
+# Pin rationale: versions are PINNED to the exact set the converter, engine,
+# and NNCF-INT8 path are developed + validated against, so an install is
+# reproducible (openvino 2026.3.0 + nncf 3.3.0, Python 3.12, Intel x86_64).
+# The converter targets the ov.convert_model / ov.save_model API (2023.1+)
+# with the ``openvino.tools.mo`` legacy fallback; the engine resolves Core /
+# AsyncInferQueue across layouts. nncf_quantize_openvino uses the NNCF 3.x
+# API (top-level ``fast_bias_correction`` kwarg + ``IgnoredScope(types=)``) —
+# NNCF 2.x renamed these (weights_bias_correction / op_types), so a 2.x
+# install would TypeError; the pin to 3.3.0 sidesteps that.
+# Both are optional — importing src.openvino_* without these installed raises
+# ImportError with a helpful message instead of crashing the toolchain.
+openvino==2026.3.0
+nncf==3.3.0

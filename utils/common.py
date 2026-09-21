@@ -43,7 +43,7 @@ def existing_validation(path: Union[str, Path]) -> Path:
     Validate that the path exists as a file (image or model) or directory.
     Supported formats:
         - Images: .jpg, .jpeg, .png, .bmp, .tiff, .webp
-        - Models: .pt, .onnx
+        - Models: .pt, .onnx, .xml (OpenVINO IR), .bin (OpenVINO weights)
     Missing paths under ``models/`` or ``data/`` additionally point at
     ARTIFACTS.md, which documents how to obtain those artifacts.
     """
@@ -62,14 +62,14 @@ def existing_validation(path: Union[str, Path]) -> Path:
 
     suffix = p.suffix.lower()
     image_suffix = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
-    model_suffix = {'.pt', '.pth', '.onnx'}
+    model_suffix = {'.pt', '.pth', '.onnx', '.xml', '.bin'}
 
     if suffix in image_suffix or suffix in model_suffix:
         return p
     else:
         raise PathValidationError(
             f"Unsupported file format: {suffix}\n"
-            f"Supported: images (.jpg/.png etc), models (.pt/.onnx)"
+            f"Supported: images (.jpg/.png etc), models (.pt/.onnx/.xml/.bin)"
         )
 
 
