@@ -137,9 +137,10 @@ def test_pure_python_tests_dont_pull_ultralytics():
 
 
 def test_consistency_parser_exposes_report_path():
-    """--report-path gives tensor and detection runs separate JSON reports —
-    the shared default path means the second of two back-to-back runs
-    replaces the first one's report."""
+    """--report-path selects the report stem + directory; run() inserts a
+    per-run <TS> between stem and suffix (consistency_report.json ->
+    consistency_report_<TS>.json), so each run writes its own report and
+    distinct stems keep tensor / detection reports side by side."""
     import argparse
     from pathlib import Path
 

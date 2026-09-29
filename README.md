@@ -3,7 +3,7 @@ Validation
 
 [![CI](https://github.com/zhj396/edge-ai-deployment/actions/workflows/ci.yml/badge.svg)](https://github.com/zhj396/edge-ai-deployment/actions/workflows/ci.yml)
 
-A production-oriented Python toolchain for taking a **YOLOv8s** PyTorch checkpoint through the full
+A Python toolchain for taking a **YOLOv8s** PyTorch checkpoint through the full
 edge-deployment lifecycle: **export → ONNX Runtime inference → static INT8 quantization (QDQ /
 MinMax or Entropy) → consistency & accuracy validation → latency / throughput / memory / mAP
 benchmark**, all reproducible from a single CLI.
@@ -45,7 +45,7 @@ documented; benchmark figures are tracked in [docs/ARCHITECTURE.md
 
 | Capability                         | What you get                                                                                                   |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| **Multi-backend inference**        | One `infer()` call across `pytorch`, `onnx_fp32`, `onnx_int8` — PyTorch / ONNX / INT8 share the same pre/post. |
+| **Multi-backend inference**        | One `infer()` call across `pytorch`, `onnx_fp32`, `onnx_int8`, plus OpenVINO engines (`OpenVINOEngine` / `OpenVINOAsyncEngine`) — all share the same pre/post. |
 | **YOLOv8 → ONNX export**           | opset 17, dynamic shape by default, ONNX simplifier, runtime-validated session.                                |
 | **Static INT8 PTQ (QDQ)**          | QUInt8 activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL) calibration.               |
 | **Head-aware quantization policy** | The **entire Detect head (`/model.22/`) kept FP32 by name-prefix**; op-type `Sigmoid/Softmax` exclusion as residual fallback. Op-type-only collapses cls scores to 0. |
@@ -62,7 +62,7 @@ documented; benchmark figures are tracked in [docs/ARCHITECTURE.md
 ```text
 ┌──────────────────────── yolov8s_ort CLI (main.py) ─────────────────────────┐
 │                                                                            │
-│   export │ inspect │ quantize │ infer │ consistency │ benchmark            │
+│   export │ inspect │ quantize │ infer │ consistency │ benchmark │ openvino   │
 │                                                                            │
 └────┬────────────┬───────────┬──────────┬───────────┬──────────┬────────────┘
      │            │           │          │           │          │
@@ -100,12 +100,14 @@ edge-ai-deployment/
 ├── requirements.txt           # Core runtime deps (shared CPU/GPU; no torch/ORT) + dev tools
 ├── requirements-cpu.txt       # CPU overlay: +cpu torch/torchvision wheels, onnxruntime
 ├── requirements-kaggle.txt    # Kaggle T4 overlay: no torch reinstall, no numpy pin
+├── requirements-openvino.txt  # OpenVINO overlay: openvino + nncf (optional backend)
 │
 ├── .github/workflows/ci.yml   # CI: flake8 + pytest on Python 3.11 / 3.12
 │
 ├── docs/                      # Deep-dive documentation
 │   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
-│   └── TRAINING.md            # Training narrative: subset build, analysis, staged long-tail
+│   ├── TRAINING.md            # Training narrative: subset build, analysis, staged long-tail
+│   ├── OPENVINO.md            # OpenVINO backend: convert, NNCF INT8, devices, benchmarking
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
 │
@@ -117,7 +119,8 @@ edge-ai-deployment/
 │   ├── quantize.py            # `quantize`— ONNX FP32 → INT8 (QDQ)
 │   ├── infer.py               # `infer`   — batch inference + visualization
 │   ├── consistency.py         # `consistency` — two models, tensor or detection mode
-│   └── benchmark.py           # `benchmark` — p50/p95/p99, FPS, RSS, mAP
+│   ├── benchmark.py           # `benchmark` — p50/p95/p99, FPS, RSS, mAP
+│   └── openvino.py            # `openvino` — convert / quantize (NNCF INT8) / run
 │
 ├── src/                       # Domain logic
 │   ├── __init__.py
@@ -129,7 +132,9 @@ edge-ai-deployment/
 │   ├── quantize.py            # YOLOv8CalibrationDataReader + quantize_static
 │   ├── sampler.py             # CalibrationSampler: stratified + phash + farthest-first
 │   ├── consistency.py         # ModelWrapper + tensor & detection comparison
-│   └── benchmark.py           # Benchmark class: latency / throughput / memory / mAP
+│   ├── benchmark.py           # Benchmark class: latency / throughput / memory / mAP
+│   ├── openvino_convert.py    # ONNX → OpenVINO IR + NNCF INT8 quantization
+│   └── openvino_engine.py     # OpenVINOEngine / OpenVINOAsyncEngine (same infer() API)
 │
 ├── utils/                     # Cross-cutting helpers
 │   ├── __init__.py
@@ -207,7 +212,7 @@ python main.py quantize --model models/yolov8s_fp32.onnx --output models/yolov8s
 # 5. Run inference on images and draw boxes
 python main.py infer --backend onnx_int8 --model models/yolov8s_int8.onnx --imgs-input data/images/val --output-dir results/predictions/onnx_int8
 
-# 6. Benchmark all three backends, with optional mAP validation
+# 6. Benchmark all backends, with optional mAP validation
 python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:models/yolov8s_fp32.onnx --model onnx_int8:models/yolov8s_int8.onnx --imgs-input data --validation --warmup 10 --runs 25
 ```
 
@@ -223,6 +228,7 @@ python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:mod
 | `infer`       | End-to-end inference with annotated overlays.                           | `--backend onnx_fp32` · `--model` · `--imgs-input` (req) · `--output-dir` · `--imgsz 640` · `--batch-size 8` · `--conf 0.25` · `--iou 0.45` · `--max-det 300` · `--no-save` |
 | `consistency` | Two-model comparison (`tensor` strict · `detection` relaxed).           | `--model1` · `--model2` · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes` · `--batch-sizes` · `--atol 1e-3` · `--rtol 1e-2` · `--report-path` |
 | `benchmark`   | Latency / throughput / memory; optional **mAP** validation.             | `--model backend:path` (repeatable) · `--imgs-input` · `--max-images 16` · `--warmup 10` · `--runs 25` · `--validation` · `--conf-threshold 0.001` · `--iou-threshold 0.7` |
+| `openvino`    | OpenVINO backend entry point: `convert` (ONNX → IR), `quantize` (NNCF INT8), `run` (inference). See [docs/OPENVINO.md](docs/OPENVINO.md). | `convert` · `quantize` · `run` · `--model` · `--output` · `--imgsz 640` · `--fp16` / `--no-fp16` · `--imgs-input` · `--max-cal-samples 300` · `--subset-size 64` · `--smooth-quant` · `--device CPU` · `--num-streams AUTO` · `--max-imgs 32` · `--batch-size 8` |
 
 ---
 
@@ -267,7 +273,7 @@ Benchmark
 
 ## Design & Engineering Notes
 
-The non-obvious decisions that distinguish a research script from a deployable toolkit. Each is
+The deliberate design decisions behind the toolkit. Each is
 documented **once** — with code refs, rationale, and measured numbers — in the [architecture
 deep-dive](docs/ARCHITECTURE.md):
 
@@ -299,6 +305,8 @@ Pure-Python unit tests; **no model or GPU required**:
 | `tests/test_consistency.py`     | `compute_iou`, `compare_tensors` (tensor / detection modes, NaN detection), `compare_detections`, re-export identity, `consistency` parser defaults (`--report-path`), ultralytics-free purity guard. |
 | `tests/test_quantize.py`        | Calibration-reader regressions: `_filter_readable` keep/drop behavior, all-unreadable raise.             |
 | `tests/test_utils.py`           | `cosine_similarity`, `percentiles`/`summarize_runs`, `color_for_class`, `draw_detections`, `existing_validation` (+ `PathValidationError` ARTIFACTS.md hint), `resolve_model_arg`/`onnx_only` path validation, `sha256_of_file`, `file_size_mb`, `clamp_workers`, `compare_models`, cross-package `__version__` consistency. |
+| `tests/test_openvino_optional_imports.py` | OpenVINO optional-dependency surface: `_LAZY` resolution, `ImportError` without openvino/nncf, device preflight (`validate_device_request` fallback/reject contract), static-batch padding, NNCF SmoothQuant gate (opt-in). |
+| `tests/test_cli_openvino_convert.py` | `openvino convert` ONNX resolution: existing-file pass-through, missing-ONNX auto-export from `.pt` (export-flag parity), missing-both error. |
 | `tests/test_train_staged_retry.py` | Training-side retry/resume state machine — self-contained, no ultralytics.                            |
 
 `tests/conftest.py` adds the project root to `sys.path` and skips the `data_dir` fixture when

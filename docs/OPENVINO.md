@@ -82,6 +82,11 @@ python main.py consistency \
     --report-path results/consistency_openvino_int8.json
 ```
 
+(Each run inserts its own `_<TS>` into the stem, so the commands above write
+`consistency_openvino_fp16_<TS>.json` / `consistency_openvino_int8_<TS>.json`;
+`<TS>` is fixed-width and sortable, so the newest report is selected by name
+sort, e.g. `ls results/consistency_openvino_*.json | sort | tail -1`.)
+
 When filling in the `_TBD_` figures, record the environment per the
 reproducibility rules: date, host, `OPENVINO_DEVICE` / actual device,
 openvino version, image count, imgsz / batch sizes.

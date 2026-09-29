@@ -7,6 +7,7 @@ from . import (
     DEFAULT_MODEL_FP32,
     DEFAULT_MODEL_PT,
     resolve_path_arg,
+    run_timestamp,
 )
 from src import validate_consistency
 
@@ -82,9 +83,14 @@ def add_parser(subparsers):
     )
     parser.add_argument(
         "--report-path", type=Path, default="results/consistency_report.json",
-        help="JSON report output path (default: results/consistency_report.json). "
-             "Give tensor and detection runs distinct paths (e.g. "
-             "results/consistency_tensor.json) so back-to-back runs keep both reports.",
+        help="JSON report stem + directory (default: results/consistency_report.json). "
+             "The CLI inserts a per-run timestamp between stem and suffix, so "
+             "this path writes results/consistency_report_<TS>.json; distinct "
+             "stems (e.g. results/consistency_tensor.json) keep tensor and "
+             "detection runs side by side, and each run writes its own file. "
+             "<TS> is fixed-width and sortable, so the newest report of a "
+             "stem is selected by name sort (e.g. "
+             "`ls results/consistency_tensor_*.json | sort | tail -1`).",
     )
 
     return parser
@@ -94,6 +100,14 @@ def add_parser(subparsers):
 # Run consistency validation command
 # =========================================================
 def run(args):
+    # One timestamp per run (see cli.run_timestamp for the format rationale).
+    # Insert <ts> between stem and suffix so the file is ``<stem>_<TS>.json``
+    # — the documented format and the fail_dir name-replace derivation in
+    # src/consistency.py both anchor on the suffixed name.
+    ts = run_timestamp()
+    report_path = args.report_path.with_name(
+        f"{args.report_path.stem}{ts}{args.report_path.suffix}"
+    )
     cfg = ConsistencyConfig(
         model1=_resolve_consistency_model(args.model1, DEFAULT_MODEL_PT),
         model2=_resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32),
@@ -106,7 +120,7 @@ def run(args):
         device=args.device,
         atol=args.atol,
         rtol=args.rtol,
-        report_path=args.report_path,
+        report_path=report_path,
     )
     # Log the full model spec (not Path.name): for prefixed specs the
     # ``openvino(_int8):`` prefix is the only signal of which backend runs.
@@ -127,6 +141,7 @@ def run(args):
         rtol=cfg.rtol,
         report_path=cfg.report_path,
     )
+    logger.info("Consistency report: %s", report_path)
     logger.info("Consistency validation complete")
     # Propagate pass/fail to the process exit code so CI (or any `set -e`
     # driver script) can act on a failed consistency check.

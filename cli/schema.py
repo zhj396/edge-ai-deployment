@@ -62,6 +62,7 @@ class BenchmarkConfig:
     warmup: int
     runs: int
     use_sampler: bool
+    timestamp_suffix: Optional[str] = None
 
 
 @dataclass

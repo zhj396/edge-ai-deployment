@@ -2,7 +2,13 @@ from typing import Dict
 from pathlib import Path
 
 from utils import get_logger
-from . import BenchmarkConfig, DEFAULT_DATA_DIR, DEFAULT_MODEL_FP32, resolve_path_arg
+from . import (
+    BenchmarkConfig,
+    DEFAULT_DATA_DIR,
+    DEFAULT_MODEL_FP32,
+    resolve_path_arg,
+    run_timestamp,
+)
 from src import Benchmark
 
 logger = get_logger(__name__)
@@ -101,6 +107,11 @@ def run(args):
         # existence-validated) through the same single source of truth as every other subcommand.
         model_dict["onnx_fp32"] = str(resolve_path_arg(None, DEFAULT_MODEL_FP32))
 
+    # One timestamp per run, shared across the summary CSV + every
+    # <backend>_perclass.csv so a single glob matches one run's artifacts.
+    # Format rationale lives on cli.run_timestamp — the single source.
+    ts = run_timestamp()
+
     cfg = BenchmarkConfig(
         model=model_dict,
         imgs_input=resolve_path_arg(args.imgs_input, DEFAULT_DATA_DIR),
@@ -117,6 +128,7 @@ def run(args):
         warmup=args.warmup,
         runs=args.runs,
         use_sampler=not args.no_sampler,
+        timestamp_suffix=ts,
     )
 
     benchmark = Benchmark(
@@ -134,8 +146,10 @@ def run(args):
         warmup=cfg.warmup,
         runs=cfg.runs,
         use_sampler=cfg.use_sampler,
+        timestamp_suffix=cfg.timestamp_suffix,
     )
 
     logger.info("========== Starting Benchmark ==========")
     summary = benchmark.run_all(cfg.model)
     logger.info("Benchmark complete: %d backends", len(summary))
+    logger.info("Benchmark summary: %s", benchmark.summary_csv_path)

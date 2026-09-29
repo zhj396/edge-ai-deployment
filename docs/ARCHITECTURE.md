@@ -499,15 +499,26 @@ def atomic_json_dump(obj, path):
 ```
 
 And after every (imgsz, batch) combination we re-dump the partial results — mid-run `SIGKILL` keeps
-partial findings. The re-dump accumulates *within* one run; across runs the report is replaced, so
-`--report-path` exists to give tensor and detection runs separate files (the shared default
-`results/consistency_report.json` keeps only the latest run).
+partial findings. The re-dump accumulates *within* one run; across runs the CLI appends a per-run
+timestamp to the report stem (`results/consistency_report_<TS>.json`, `<TS>` =
+`_YYYYMMDD_HHMMSS_<ms>`), so each run writes its own report file. `--report-path` selects the stem +
+directory (e.g. `results/consistency_tensor.json` → `consistency_tensor_<TS>.json`), keeping tensor
+and detection runs side by side. No fixed-name alias is written: each run's report is a separate
+file, and `<TS>` is fixed-width and sortable, so the newest report of a stem is selected by name
+sort (`max(glob("<stem>_*.json"))` or `ls ... | sort | tail -1`). Direct library callers that omit
+`report_path` still get the unsuffixed fixed path.
+
+When the run completes, a final dump supersedes the last incremental write and adds the
+`overall_pass` verdict. The incremental writes omit it because the verdict only exists once every
+(imgsz, batch) config has run; a report without an `overall_pass` key is a crash-left partial, not a
+verdict.
 
 ### 7.5 Failed-image triage
 
 When `copy_failed_samples=True` and a batch fails, every image in that batch is copied to
-`results/consistency_failed/<uuid>_name.jpg`. This is the single biggest productivity boost: you
-eyeball the failure mode without searching the dataset.
+`results/consistency_failed[_<TS>]/<uuid>_name.jpg` — the failed-sample directory mirrors the report
+filename 1:1 (the CLI's timestamped report writes `consistency_failed_<TS>/`; a library caller on
+the unsuffixed default gets `consistency_failed/`).
 
 ---
 

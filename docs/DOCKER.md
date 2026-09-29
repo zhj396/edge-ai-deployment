@@ -101,8 +101,9 @@ docker run --rm \
         --runs 25
 ```
 
-The resulting `results/benchmark_summary.csv` shows up on your host because of
-the `-v` bind.
+The resulting `results/benchmark_summary_<TS>.csv` shows up on your host because of
+the `-v` bind. Each CLI run is timestamped; take the newest summary with
+`ls -t results/benchmark_summary_*.csv | head -1`.
 
 ### Via docker compose
 

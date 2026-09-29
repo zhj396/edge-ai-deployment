@@ -88,6 +88,7 @@ class Benchmark:
         warmup: int = 10,
         runs: int = 25,
         use_sampler: bool = True,
+        timestamp_suffix: Optional[str] = None,
     ) -> None:
         self.imgs_input = imgs_input
         self.max_images_for_speed = max_images_for_speed
@@ -111,6 +112,11 @@ class Benchmark:
         self.warmup = warmup
         self.runs = runs
         self.use_sampler = use_sampler
+        # Timestamp suffix appended to ``benchmark_summary.csv`` + every
+        # ``<backend>_perclass.csv`` so each benchmark run leaves a persistent,
+        # sortable artifact. The CLI generates it once per run; library callers
+        # that omit it get the unsuffixed fixed path (back-compat).
+        self.timestamp_suffix = timestamp_suffix or ""
 
         # Speed-test image set: use a diverse subset rather than the first N images (avoids
         # over-warm caches and bias toward similar scenes).
@@ -147,6 +153,13 @@ class Benchmark:
                 data_yaml, max_images_for_speed
             )
         logger.info("Speed test set: %d images", len(self.speed_imgs))
+
+    @property
+    def summary_csv_path(self) -> str:
+        """Canonical summary CSV path for this run. Single-sourced so the CLI
+        does not re-derive the filename pattern and drift from what
+        ``run_all`` actually writes."""
+        return f"results/benchmark_summary{self.timestamp_suffix}.csv"
 
     @staticmethod
     def _load_val_paths(data_yaml: Path, n: int) -> List[Path]:
@@ -251,7 +264,7 @@ class Benchmark:
             logger.warning("%s overall metrics parse failed: %s", backend_name, e)
 
         os.makedirs("results", exist_ok=True)
-        csv_path = f"results/{backend_name}_perclass.csv"
+        csv_path = f"results/{backend_name}_perclass{self.timestamp_suffix}.csv"
         pd.DataFrame(rows, columns=["backend", "class", "mAP50", "mAP50-95"]) \
             .to_csv(csv_path, index=False)
         logger.info("%s per-class metrics saved: %s", backend_name, csv_path)
@@ -560,7 +573,7 @@ class Benchmark:
         ])
 
         os.makedirs("results", exist_ok=True)
-        summary_df.to_csv("results/benchmark_summary.csv", index=False)
+        summary_df.to_csv(self.summary_csv_path, index=False)
         logger.info("========== Benchmark Summary ==========")
         logger.info("\n%s", summary_df.round(3).to_string(index=False))
         return summary_df
