@@ -344,6 +344,88 @@ core and applies to both entry points — it must not be duplicated per
 path.
 `preprocess_frames` is registered in `src/__init__.py::_LAZY`.
 
+### 16. OpenVINO is an optional backend with a strict import contract
+
+`src/openvino_engine.py` and `src/openvino_convert.py` depend on
+`openvino` / `nncf`, which are not in the base pin set —
+`requirements-openvino.txt` is an overlay installed on top of
+`requirements-cpu.txt`. Both modules import these dependencies under
+`try/except ImportError` at module top and expose availability
+predicates (`openvino_available`, `openvino_conversion_available`,
+`nncf_available`). Code paths without the dependency must fail with an
+`ImportError` carrying an install hint — never an `AttributeError`
+from a half-imported module.
+
+All public names (`OpenVINOEngine`, `OpenVINOAsyncEngine`,
+`convert_onnx_to_openvino_ir`, `nncf_quantize_openvino`,
+`openvino_available`, `openvino_conversion_available`,
+`nncf_available`) must stay registered in `src/__init__.py::_LAZY`.
+`cli/openvino.py` resolves them through `from src import ...` at
+module top, so an unregistered name breaks the CLI import entirely.
+
+Use `import openvino as ov` and resolve `Core` / `AsyncInferQueue`
+by attribute (top-level first, then the `openvino.runtime`
+submodule). On modern builds the symbols live at the top level and
+`AsyncInferQueue` is absent from the `runtime` submodule, so
+`from openvino.runtime import Core, AsyncInferQueue` fails there
+while the converter (which uses the `import ... as` form) works.
+
+`OpenVINOEngine` mirrors `YOLOv8Engine`'s API (`infer`,
+`infer_frames`, shared `_run_batch`, explicit `nc=` to `post_process`
+per invariant 9) so the server hot path and `benchmark` plug in
+unchanged; do not let it drift from `YOLOv8Engine`'s shape.
+
+Three behaviors deliberately differ from the ORT path:
+
+- **Head exclusion is two-layer, not name-prefix-only.** ORT INT8
+  excludes the Detect head by node-name prefix (invariant 3). The
+  NNCF path uses `nncf.IgnoredScope(patterns=[r"/model\.22/.*"],
+  types=["Sigmoid", "Softmax"], validate=False)`: the pattern layer is
+  head-precise on builds that keep ONNX friendly names; the op-type
+  layer is the portable floor for builds that rewrote them (YOLOv8s
+  carries exactly one Sigmoid and one Softmax, both inside the head).
+  `src/openvino_convert.py` logs whether the pattern layer is active
+  or inert.
+- **The IR batch dim mirrors the ONNX, never forced.**
+  `_resolve_input_shape` reads the ONNX input's batch dim (static →
+  static, dynamic → dynamic) because the Detect head's DFL Reshape
+  constant is baked to the export batch: forcing `[-1, ...]` on a
+  static-batch ONNX lets the input accept batch>1 but still crashes
+  mid-graph at the head; forcing `[1, ...]` on a dynamic ONNX would
+  reject batch>1 at the input. Spatial dims are pinned to `imgsz`,
+  and a mismatch with the export size raises. The engine reads
+  `_model_batch` from `input_tensor.shape[0].get_length()` inside a
+  try — the static `Shape` accessor raises on a dynamic-batch IR —
+  and falls through to `_model_batch=None`, after which
+  `_effective_batch()` honors `--batch-size`. On a static IR,
+  `_effective_batch` always steps at `_model_batch` and `_forward`
+  zero-pads the trailing partial batch up to that count, runs, and
+  slices the output back to the real image count.
+- **FP16 is a save-time property, not a `convert_model` kwarg.**
+  `convert_onnx_to_openvino_ir` applies FP16 through `_save_ir`,
+  passing `compress_to_fp16` explicitly in both directions to
+  `ov.save_model` — whose default is FP16, so omitting the kwarg
+  would silently write FP16 even for a `--no-fp16` request. On builds
+  without the kwarg it degrades to the build default and reports
+  `actual_fp16=None` (precision unspecified) in the log. The legacy
+  `mo.convert_model` path uses `data_type=` directly.
+
+NNCF INT8 quantization (`nncf_quantize_openvino`) is pinned to the
+NNCF 3.x API (`fast_bias_correction` as a top-level kwarg,
+`IgnoredScope(types=)`); NNCF 2.x renamed both and would `TypeError`.
+SmoothQuant requires `model_type=ModelType.TRANSFORMER` — passing
+`smooth_quant_alphas` alone adds no SmoothQuant step — and pins
+`preset=PERFORMANCE` so an on/off A/B stays attributable to
+SmoothQuant alone.
+
+Benchmark and consistency select the OpenVINO device through
+`OPENVINO_DEVICE` (default `CPU`), not `--device` — OpenVINO consumes
+host numpy, so `--device` still controls only where preprocessing
+runs. `benchmark` accepts `openvino:` / `openvino_int8:` model
+prefixes, and `--validation` (the native COCO evaluator) drives
+`OpenVINOEngine` for both prefixes; the evaluator skip applies to
+backends that cannot drive `evaluate_map` (e.g. `ort_cpp`).
+
 ## Testing and Quality Gates
 
 The default test suite is deliberately designed to run without a model,

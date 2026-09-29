@@ -27,7 +27,10 @@ def add_parser(subparsers):
             "Model config in 'backend:path' format. Can be specified multiple "
             "times. Example: --model pytorch:models/yolov8s.pt "
             "--model onnx_fp32:models/yolov8s_fp32.onnx "
-            "--model onnx_int8:models/yolov8s_int8.onnx"
+            "--model onnx_int8:models/yolov8s_int8.onnx "
+            "--model openvino:models/yolov8s_openvino.xml "
+            "--model openvino_int8:models/yolov8s_openvino_int8.xml "
+            "(openvino device is selected via the OPENVINO_DEVICE env var)"
         ),
     )
     parser.add_argument(
@@ -82,7 +85,7 @@ def run(args):
             backend = backend.strip()
             path = path.strip()
 
-            if backend not in ["pytorch", "onnx_fp32", "onnx_int8"]:
+            if backend not in ["pytorch", "onnx_fp32", "onnx_int8", "openvino", "openvino_int8"]:
                 # A bare Windows path ("C:\models\x.onnx") partitions into
                 # backend="C" — point the user at the real problem instead.
                 if len(backend) == 1 and path.startswith(("\\", "/")):
