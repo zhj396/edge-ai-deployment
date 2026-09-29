@@ -704,6 +704,24 @@ decimals (0.589596683 / 0.589596668). Absolute mAP sits below the Ultralytics-pa
 path. OpenVINO RSS Δ (435.6 MB) exceeds the ORT rows (214.2 MB FP32) — the OpenVINO runtime
 footprint, a selection factor for memory-constrained targets.
 
+**ORT-C++ measurement — FP32, driver benchmark** (2026-09-29; same WSL2 i5-13420H host, ort_cpp
+built on the vendored ORT 1.20.0 SDK, `--intra-op-threads 4` matching the Python single-stream
+posture; speed loop = the same 14 sampler-selected val images cycled for 200 iterations, warmup 3,
+batch 1; latency = driver's own per-iteration wallclock, `results/cpp_bench.json`). mAP and
+consistency rows are not applicable — the driver is a standalone executable and is not wired into
+`utils/map_eval` or the consistency harness (see [docs/ORT_CPP.md](ORT_CPP.md)). **Placeholder —
+recorded on a working (non-idle) host; numbers pending replacement by an idle-host re-measurement.**
+
+| Backend            | mean_latency (ms) | p50 (ms) | p95 (ms) | FPS  | peak RSS (MB) |
+| ------------------ | ----------------- | -------- | -------- | ---- | ------------- |
+| ort_cpp (ONNX FP32)| 242.9             | 236.8    | 288.6    | 4.12 | 207.7         |
+
+Note the protocol difference from the five-backend block above: the C++ driver times per-iteration
+latency (decode → letterbox → forward → NMS) over a cycled image set, while the Python harness times
+per-run wallclock including the batcher; the numbers are therefore indicative, not row-comparable.
+The headline that does carry over: peak RSS 207.7 MB for a full C++ pipeline (OpenCV + ORT session),
+same order as the Python ONNX FP32 row and well below the OpenVINO runtime footprint.
+
 **PT ↔ ONNX FP32** (tensor mode, 91 images, `--atol 1e-4 --rtol 1e-3`): **PASS** — max_diff mean ≈
 0.002, cosine ≈ 1.000 (`results/consistency_report_tensor.json`).
 
