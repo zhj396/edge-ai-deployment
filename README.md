@@ -108,6 +108,7 @@ edge-ai-deployment/
 │   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
 │   ├── TRAINING.md            # Training narrative: subset build, analysis, staged long-tail
 │   ├── OPENVINO.md            # OpenVINO backend: convert, NNCF INT8, devices, benchmarking
+│   ├── DOCKER.md              # Docker toolchain + server images
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
 │
@@ -226,7 +227,7 @@ python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:mod
 | `inspect`     | Print ONNX metadata (sha256, opset, I/O, size, producer).               | `--model` (req) · `--compare`                                                                   |
 | `quantize`    | ONNX FP32 → INT8 (QDQ, **MinMax** or **Entropy** calibration).          | `--model` · `--output` · `--imgs-input` · `--imgsz 640` · `--batch-size 1` · `--method MinMax` · `--max-cal-samples 300` · `--resnet50` · `--device cpu` |
 | `infer`       | End-to-end inference with annotated overlays.                           | `--backend onnx_fp32` · `--model` · `--imgs-input` (req) · `--output-dir` · `--imgsz 640` · `--batch-size 8` · `--conf 0.25` · `--iou 0.45` · `--max-det 300` · `--no-save` |
-| `consistency` | Two-model comparison (`tensor` strict · `detection` relaxed).           | `--model1` · `--model2` · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes` · `--batch-sizes` · `--atol 1e-3` · `--rtol 1e-2` · `--report-path` |
+| `consistency` | Two-model comparison (`tensor` strict · `detection` relaxed).           | `--model1` · `--model2` (accept `openvino:`/`openvino_int8:` prefixes for OpenVINO IR) · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes` · `--batch-sizes` · `--atol 1e-3` · `--rtol 1e-2` · `--report-path` (per-run `<TS>` inserted) |
 | `benchmark`   | Latency / throughput / memory; optional **mAP** validation.             | `--model backend:path` (repeatable) · `--imgs-input` · `--max-images 16` · `--warmup 10` · `--runs 25` · `--validation` · `--conf-threshold 0.001` · `--iou-threshold 0.7` |
 | `openvino`    | OpenVINO backend entry point: `convert` (ONNX → IR), `quantize` (NNCF INT8), `run` (inference). See [docs/OPENVINO.md](docs/OPENVINO.md). | `convert` · `quantize` · `run` · `--model` · `--output` · `--imgsz 640` · `--fp16` / `--no-fp16` · `--imgs-input` · `--max-cal-samples 300` · `--subset-size 64` · `--smooth-quant` · `--device CPU` · `--num-streams AUTO` · `--max-imgs 32` · `--batch-size 8` |
 
@@ -305,6 +306,7 @@ Pure-Python unit tests; **no model or GPU required**:
 | `tests/test_consistency.py`     | `compute_iou`, `compare_tensors` (tensor / detection modes, NaN detection), `compare_detections`, re-export identity, `consistency` parser defaults (`--report-path`), ultralytics-free purity guard. |
 | `tests/test_quantize.py`        | Calibration-reader regressions: `_filter_readable` keep/drop behavior, all-unreadable raise.             |
 | `tests/test_utils.py`           | `cosine_similarity`, `percentiles`/`summarize_runs`, `color_for_class`, `draw_detections`, `existing_validation` (+ `PathValidationError` ARTIFACTS.md hint), `resolve_model_arg`/`onnx_only` path validation, `sha256_of_file`, `file_size_mb`, `clamp_workers`, `compare_models`, cross-package `__version__` consistency. |
+| `tests/test_cli_output_paths.py`| Per-run timestamp contract: report/summary path derivation (no double extension, stays under `--report-path`'s dir), distinct stems keep independent reports (no alias files), consistency exit codes, plus a dependency-free compile smoke over the CLI/src entry modules. |
 | `tests/test_openvino_optional_imports.py` | OpenVINO optional-dependency surface: `_LAZY` resolution, `ImportError` without openvino/nncf, device preflight (`validate_device_request` fallback/reject contract), static-batch padding, NNCF SmoothQuant gate (opt-in). |
 | `tests/test_cli_openvino_convert.py` | `openvino convert` ONNX resolution: existing-file pass-through, missing-ONNX auto-export from `.pt` (export-flag parity), missing-both error. |
 | `tests/test_train_staged_retry.py` | Training-side retry/resume state machine — self-contained, no ultralytics.                            |

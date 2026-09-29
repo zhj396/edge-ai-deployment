@@ -102,9 +102,11 @@ value the IR cannot serve — spatial dims are pinned at conversion (see below),
 the two sizes named; a dynamically-shaped IR (no pinned spatial dims) skips the check. `--device` is
 not consulted for the OpenVINO side — a `--device cuda` run is an ORT-CUDA vs OpenVINO cross-device
 comparison, valid but deliberate. The report records both the requested and the actual OpenVINO
-device (`engine.device` after any CPU fallback). `benchmark --validation` still cannot substitute —
-mAP validation intentionally skips raw IR (no ultralytics metadata). Pass `--no-fp16` if you want
-full FP32 (rarely useful at inference time).
+device (`engine.device` after any CPU fallback). The two measurements are complementary:
+`benchmark --validation` reports full-val aggregate mAP for raw OpenVINO IRs through the native
+evaluator (`utils/map_eval`); a consistency run adds the per-image gate detail (IoU / score / class)
+that an aggregate mAP does not show. Pass `--no-fp16` if you want full FP32 (rarely useful at
+inference time).
 
 The converter uses `ov.convert_model()` from the 2023.1+ API. The input shape's **batch dimension
 mirrors the ONNX's** (`_resolve_input_shape` reads the ONNX's first input — static `[1,3,...]` if

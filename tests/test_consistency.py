@@ -129,6 +129,7 @@ def test_pure_python_tests_dont_pull_ultralytics():
     import test_consistency   # noqa: F401
     import test_quantize      # noqa: F401
     import test_utils         # noqa: F401
+    import test_map_eval      # noqa: F401  (utils.map_eval — pure-NumPy mAP)
 
     assert "ultralytics" not in sys.modules, (
         "pure-Python test modules must not import ultralytics; "

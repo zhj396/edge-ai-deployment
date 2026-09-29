@@ -17,6 +17,12 @@ from .model_utils import (
     select_providers,
     compare_models,
 )
+from .map_eval import (
+    box_iou,
+    compute_map,
+    evaluate_map,
+    load_ground_truth,
+)
 from src import __version__  # noqa: F401  (re-exported for utils.__version__)
 
 
@@ -39,6 +45,11 @@ __all__ = [
     "inspect_onnx",
     "select_providers",
     "compare_models",
+    # utils.map_eval — pure-NumPy COCO mAP; safe without ultralytics.
+    "box_iou",
+    "compute_map",
+    "evaluate_map",
+    "load_ground_truth",
     # utils.comparison — pure NumPy; safe to import without ultralytics.
     "cosine_similarity",
     "compare_tensors",

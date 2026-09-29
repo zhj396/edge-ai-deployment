@@ -22,7 +22,7 @@ import os
 import platform
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import onnxruntime as ort
@@ -94,11 +94,13 @@ class Benchmark:
         self.max_images_for_speed = max_images_for_speed
         self.imgsz = imgsz
         self.batch_size = batch_size
-        # conf/iou_threshold drive the optional mAP *validation* (model.val), which needs
-        # COCO-standard conf->0 / iou=0.7 for a correct PR curve. speed_conf/speed_iou drive
-        # the NMS inside the *speed* loop and default to engine.infer's deploy values (0.25 / 0.45)
-        # so the timed region measures the real deployed pipeline, not an NMS-at-conf=0.001 path
-        # that would process all 8400 boxes and be NMS-bound rather than forward-bound.
+        # conf/iou_threshold drive the optional mAP *validation* (the native
+        # COCO evaluator, utils/map_eval), which needs COCO-standard conf->0 /
+        # iou=0.7 for a correct PR curve. speed_conf/speed_iou drive the NMS
+        # inside the *speed* loop and default to engine.infer's deploy values
+        # (0.25 / 0.45) so the timed region measures the deployed pipeline: an
+        # NMS at conf=0.001 would process all 8400 boxes and make the loop
+        # NMS-bound rather than forward-bound.
 
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
@@ -118,8 +120,8 @@ class Benchmark:
         # that omit it get the unsuffixed fixed path (back-compat).
         self.timestamp_suffix = timestamp_suffix or ""
 
-        # Speed-test image set: use a diverse subset rather than the first N images (avoids
-        # over-warm caches and bias toward similar scenes).
+        # Speed-test image set: sample a diverse subset (sampler-selected) so
+        # timings cover varied scenes rather than one scene type.
 
         data_yaml = Path(imgs_input) / "data.yaml"
         if not data_yaml.exists():
@@ -217,58 +219,97 @@ class Benchmark:
         for i in range(0, len(imgs), batch_size):
             yield imgs[i : i + batch_size]
 
-    # mAP
-    def _compute_map(self, model: YOLO, backend_name: str):
-        """Run Ultralytics ``model.val`` to get per-class mAP."""
-        logger.info("Computing mAP for %s on full validation set...", backend_name)
+    # mAP (native, backend-agnostic)
+    def _compute_map_native(
+        self, backend: str, model_path: str
+    ) -> Tuple[Optional[Dict], str]:
+        """Run the backend-agnostic COCO mAP evaluator on ``backend``.
+
+        Constructs the engine matching ``backend`` and drives its shared
+        ``infer()`` API through ``utils.map_eval.evaluate_map`` (conf=0.001,
+        iou=0.7 — the COCO mAP-standard NMS config, from
+        ``self.conf_threshold`` / ``self.iou_threshold``). All CLI backends go
+        through this evaluator, so their mAP50 / mAP50-95 share one COCO
+        metric and are directly comparable across backends.
+
+        Returns ``(result, mAP_source)``: ``result`` is
+        ``{"mAP50", "mAP50-95"}`` (values None if every class has zero GT) or
+        ``None``; ``mAP_source`` is the provenance string surfaced in the
+        summary CSV — one of ``"native evaluator"``,
+        ``"unsupported backend (no Python engine to drive)"``,
+        ``"failed: native evaluator crashed (see log)"``, or
+        ``"no GT: every class has zero ground truth in the val set"``.
+        Any crash (engine construction included) is caught and logged — the
+        benchmark run continues, the row just carries no mAP.
+        """
+        supported = (
+            backend == "pytorch"
+            or backend in ("onnx_fp32", "onnx_int8")
+            or backend.startswith("openvino")
+        )
+        if not supported:
+            logger.warning(
+                "mAP unsupported for %s: no Python engine to drive "
+                "(backends without an infer() API are out of scope)", backend,
+            )
+            return None, "unsupported backend (no Python engine to drive)"
+
+        from utils.map_eval import evaluate_map
+        from . import (
+            YOLOv8Engine,
+            OpenVINOEngine,
+            openvino_available,
+        )
+
         data_yaml = Path(self.imgs_input) / "data.yaml"
+        logger.info("Computing mAP (native evaluator) for %s...", backend)
 
         try:
-            results = model.val(
-                data=str(data_yaml),
-                imgsz=self.imgsz,
-                batch=self.batch_size,
+            if backend == "pytorch":
+                engine = YOLOv8Engine(
+                    model_path=model_path, backend="pytorch",
+                    imgsz=self.imgsz, device=self.device,
+                )
+            elif backend in ("onnx_fp32", "onnx_int8"):
+                engine = YOLOv8Engine(
+                    model_path=model_path, backend=backend,
+                    imgsz=self.imgsz, device=self.device,
+                )
+            else:  # backend.startswith("openvino") — supported check passed
+                if not openvino_available():
+                    raise RuntimeError(
+                        "openvino is not installed. Run: "
+                        "pip install -r requirements-openvino.txt"
+                    )
+                # Device follows OPENVINO_DEVICE (default CPU) — same posture
+                # as _run_openvino (--device is irrelevant for OpenVINO since
+                # it takes host numpy).
+                ov_device = os.environ.get("OPENVINO_DEVICE", "CPU")
+                engine = OpenVINOEngine(
+                    model_path=model_path, device=ov_device,
+                    imgsz=self.imgsz, data_yaml=data_yaml,
+                )
+
+            result = evaluate_map(
+                engine=engine,
+                data_yaml=data_yaml,
                 conf=self.conf_threshold,
                 iou=self.iou_threshold,
-                device=self.device,
-                save=False,
-                plots=False,
-                save_json=False,
-                verbose=False,
+                batch_size=self.batch_size,
+                max_det=300,
+                backend_name=backend,
+                timestamp_suffix=self.timestamp_suffix,
+                class_names_override=getattr(engine, "class_names", None),
             )
         except Exception as e:
-            logger.exception("mAP computation failed for %s: %s", backend_name, e)
-            return None
+            logger.exception("mAP computation failed for %s: %s", backend, e)
+            return None, "failed: native evaluator crashed (see log)"
 
-        rows = []
-        for cls_metrics in results.summary():
-            cls_name = cls_metrics.get("Class") or cls_metrics.get("class") or "unknown"
-            rows.append([
-                backend_name,
-                cls_name,
-                float(cls_metrics.get("mAP50", cls_metrics.get("map50", 0.0))),
-                float(cls_metrics.get("mAP50-95", cls_metrics.get("map", 0.0))),
-            ])
-            logger.info(
-                "%s | %s: mAP50=%.4f, mAP50-95=%.4f",
-                backend_name, cls_name, rows[-1][2], rows[-1][3],
-            )
-
-        try:
-            p, r, map50, map5095 = results.mean_results()
-            logger.info(
-                "%s Overall | P=%.4f, R=%.4f, mAP50=%.4f, mAP50-95=%.4f",
-                backend_name, p, r, map50, map5095,
-            )
-        except Exception as e:
-            logger.warning("%s overall metrics parse failed: %s", backend_name, e)
-
-        os.makedirs("results", exist_ok=True)
-        csv_path = f"results/{backend_name}_perclass{self.timestamp_suffix}.csv"
-        pd.DataFrame(rows, columns=["backend", "class", "mAP50", "mAP50-95"]) \
-            .to_csv(csv_path, index=False)
-        logger.info("%s per-class metrics saved: %s", backend_name, csv_path)
-        return results
+        if result is None:
+            return None, "failed: native evaluator crashed (see log)"
+        if result["mAP50"] is None:
+            return result, "no GT: every class has zero ground truth in the val set"
+        return result, "native evaluator"
 
     # pytorch path
     def _run_pytorch(self, backend: str, model_path: str) -> Dict:
@@ -532,21 +573,24 @@ class Benchmark:
             else:
                 speed = self._run_onnx(backend, model_path)
 
-            if self.validation:
-                if backend.startswith("openvino"):
-                    # Ultralytics' YOLO() can load its own OpenVINO export
-                    # (an openvino_model/ folder) but not a raw .xml produced
-                    # by our converter — it lacks the ultralytics metadata.
-                    # Skip rather than crash; run validation on the .pt if mAP
-                    # is needed.
-                    logger.warning(
-                        "mAP validation skipped for %s (raw OpenVINO IR not "
-                        "loadable by Ultralytics YOLO; validate the .pt instead)",
-                        backend,
-                    )
-                else:
-                    val_model = YOLO(model_path, task='detect')
-                    self._compute_map(val_model, backend)
+            # mAP provenance: track per-row why mAP is present, unsupported,
+            # failed, or disabled; surfaced as the `mAP_source` column in the
+            # summary CSV. All CLI backends run through one native COCO
+            # evaluator (utils.map_eval over each engine's infer()) so their
+            # mAP50 / mAP50-95 share one metric and are comparable across
+            # backends. A backend without a Python engine to drive reports
+            # `unsupported`; its precision signal is the cross-backend
+            # consistency harness (src/consistency.py — raw-tensor allclose
+            # + conf-cliff gate).
+            map50 = None
+            map5095 = None
+            if not self.validation:
+                map_source = "disabled (--validation off)"
+            else:
+                m, map_source = self._compute_map_native(backend, model_path)
+                if m is not None and m["mAP50"] is not None:
+                    map50 = m["mAP50"]
+                    map5095 = m["mAP50-95"]
 
             results.append(speed)
             summary_rows.append([
@@ -564,12 +608,16 @@ class Benchmark:
                 speed.get("p99", 0.0),
                 speed.get("peak_memory_mb", 0.0),
                 speed.get("rss_increase_mb", 0.0),
+                map50,
+                map5095,
+                map_source,
             ])
 
         summary_df = pd.DataFrame(summary_rows, columns=[
             "Model", "Backend", "Device", "BatchSize", "Total_s", "Batch_s",
             "Image_s", "FPS", "Latency_ms_mean", "p50_ms", "p95_ms",
             "p99_ms", "Peak_Memory_MB", "RSS_Increase_MB",
+            "mAP50", "mAP50-95", "mAP_source",
         ])
 
         os.makedirs("results", exist_ok=True)

@@ -294,8 +294,8 @@ For cross-provider INT8 — the scenario this toolkit targets — QDQ wins.
 * **Weights are symmetric** (`QInt8`, `WeightSymmetric=True`). Centered at zero; symmetric is the
   universal default because GPU/CPU GEMM kernels all natively multiply signed×signed.
 * **Per-channel weights.** A single conv filter's channels can have wildly different dynamic ranges;
-  per-channel preserves accuracy for "tiny" channels that would otherwise be drowned. Per-tensor
-  would drown those channels and cost measurable mAP on YOLOv8s.
+  per-channel preserves accuracy for "tiny" channels whose range a per-tensor scale would flatten
+  into coarse quantization steps. Per-tensor weights cost measurable mAP on YOLOv8s.
 
 ### 5.4 Calibration methods
 
@@ -547,8 +547,29 @@ For each backend:
                 both backends reset, so the number is comparable)
 ```
 
-And — when `--validation` is passed — a **per-class mAP** via Ultralytics' `model.val(...)`, which
-we read into a CSV per backend (`results/<backend>_perclass.csv`).
+And — when `--validation` is passed — a **per-class mAP** from the backend-agnostic native COCO
+evaluator (`utils/map_eval.py`), driven over each backend's shared `infer()` API (conf=0.001,
+iou=0.7 — the COCO-standard PR-curve config from `--conf-threshold` / `--iou-threshold`). Every
+backend with a Python engine — including raw OpenVINO IRs — goes through the same evaluator, so
+mAP50 / mAP50-95 are directly comparable across backends. CLI runs write the per-class rows to
+`results/<backend>_perclass_<TS>.csv` (library callers that omit the timestamp suffix get the
+unsuffixed `<backend>_perclass.csv`); the summary CSV records three columns: `mAP50`, `mAP50-95`,
+and `mAP_source`.
+
+**mAP provenance (`mAP_source`).** Each summary row records *why* its mAP is present or absent:
+`native evaluator` (measured), `unsupported backend (no Python engine to drive)` (a backend without
+an `infer()` API — its precision signal is the §7 consistency harness),
+`failed: native evaluator crashed (see log)` (engine construction or evaluation raised; the run
+continues), `no GT: every class has zero ground truth in the val set`, or
+`disabled (--validation off)`. A row without a measurement carries its reason in `mAP_source`; it is
+not reported as zero.
+
+**Comparability caveat.** The native evaluator computes class-mean mAP with pycocotools' greedy
+conf-descending matcher (already-matched GTs are skipped, so a detection can bind a lower-IoU
+unmatched GT), but it is not pycocotools: maxDets is the engine's per-image cap (300, vs COCO's
+official 100), crowd/ignore regions are not modeled, and confidence ties break deterministically by
+(image, box position) — so its numbers can deviate a little from Ultralytics/pycocotools runs on the
+same detections. The §11 historical tables were measured with the Ultralytics evaluator.
 
 ### 8.2 Memory hygiene between backends
 
@@ -686,18 +707,18 @@ diagnosed as the INT8-on-CUDA box-coordinate divergence (finding 2 above), not a
 * **The quantizer's `EnableSubgraph=True` extra option matters.** Without it, `quantize_static`
   falls back to per-op quantization on certain layers, and the fallback costs measurable mAP.
 * **Pre-warm the ORT session, not torch.** The first ORT forward is materially slower than steady
-  state, and on CUDA that's where you discover CUDA EP isn't actually active.
+  state, and on CUDA that's where an inactive CUDA EP surfaces.
 * **A host copy of the input throttles the CUDA path.** Feeding `tensor.cpu().numpy()` into a CUDA
   session serializes GPU work behind a host round-trip; IO Binding + DLPack keeps the input tensor
   on the device (§4.3).
 * **Keep the whole Detect head in FP32, not just Sigmoid/Softmax.** Op-type exclusion of
   `Sigmoid/Softmax` only skips the activation *nodes* — the upstream cls conv stays QDQ-wrapped and
   the post-Sigmoid class scores collapse to zero (0 detections). Excluding the whole `/model.22/`
-  head by name-prefix keeps the cls-logit path in FP32 end to end and recovers the cls scores (max Δ
-  0.046 in post-sigmoid score space — §5.5); the head is <5% of FLOPs so the speed cost is
+  head by name-prefix keeps the cls-logit path in FP32 end to end and preserves the cls scores (max
+  Δ 0.046 in post-sigmoid score space — §5.5); the head is <5% of FLOPs so the speed cost is
   negligible.
-* **Atomic JSON is the difference between 30 s and 30 min of debugging.** A mid-run crash leaves the
-  partial findings instead of a half-written (or empty) report.
+* **Atomic JSON keeps partial findings readable.** A mid-run crash leaves the partial findings in
+  place instead of a half-written (or empty) report.
 * **Tests that depend on models test the model, not the code.** Pure-Python tests run in CI in 2
   seconds; if they were coupled to `.onnx` they'd be skipped locally and lie about the build status.
 
