@@ -13,6 +13,19 @@ from src import validate_consistency
 logger = get_logger(__name__)
 
 
+def _resolve_consistency_model(arg, default):
+    """Resolve a --model1/--model2 arg, allowing a backend prefix.
+
+    A plain path goes through ``resolve_path_arg`` (existing-validation). A
+    prefixed spec (``openvino(_int8):<xml>``) is a backend selector, not a
+    path — pass it through verbatim; ``ModelWrapper`` parses the prefix and
+    resolves the model lazily on the first forward.
+    """
+    if arg and str(arg).startswith(("openvino:", "openvino_int8:")):
+        return arg
+    return resolve_path_arg(arg, default)
+
+
 # =========================================================
 # Add CLI subparser
 # =========================================================
@@ -29,12 +42,16 @@ def add_parser(subparsers):
     # cli/__init__.py for the rationale. The defaults are resolved inside ``run()``.
 
     parser.add_argument(
-        "--model1", type=Path, default=None,
-        help=f"Reference model (default: {DEFAULT_MODEL_PT})",
+        "--model1", type=str, default=None,
+        help=f"Reference model (default: {DEFAULT_MODEL_PT}). Prefix "
+        f"'openvino:' or 'openvino_int8:' to compare an OpenVINO IR, "
+        f"e.g. 'openvino_int8:models/yolov8s_openvino_int8.xml' "
+        f"(OPENVINO_DEVICE env var selects CPU/GPU/AUTO).",
     )
     parser.add_argument(
-        "--model2", type=Path, default=None,
-        help=f"Comparison model (default: {DEFAULT_MODEL_FP32})",
+        "--model2", type=str, default=None,
+        help=f"Comparison model (default: {DEFAULT_MODEL_FP32}). Accepts the "
+        f"'openvino:' and 'openvino_int8:' prefixes like --model1.",
     )
     parser.add_argument(
         "--imgs-input", type=Path, default=None,
@@ -78,8 +95,8 @@ def add_parser(subparsers):
 # =========================================================
 def run(args):
     cfg = ConsistencyConfig(
-        model1=resolve_path_arg(args.model1, DEFAULT_MODEL_PT),
-        model2=resolve_path_arg(args.model2, DEFAULT_MODEL_FP32),
+        model1=_resolve_consistency_model(args.model1, DEFAULT_MODEL_PT),
+        model2=_resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32),
         imgs_input=resolve_path_arg(args.imgs_input, DEFAULT_DATA_DIR),
         mode=args.mode,
         max_images=args.max_images,
@@ -91,8 +108,10 @@ def run(args):
         rtol=args.rtol,
         report_path=args.report_path,
     )
+    # Log the full model spec (not Path.name): for prefixed specs the
+    # ``openvino(_int8):`` prefix is the only signal of which backend runs.
     logger.info(
-        f"Starting consistency check: {Path(cfg.model1).name} vs {Path(cfg.model2).name}"
+        f"Starting consistency check: {cfg.model1} vs {cfg.model2}"
     )
     results = validate_consistency(
         model1=cfg.model1,

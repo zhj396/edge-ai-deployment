@@ -153,3 +153,131 @@ def test_consistency_parser_exposes_report_path():
 
     args = parser.parse_args(["consistency", "--report-path", "results/tensor.json"])
     assert args.report_path == Path("results/tensor.json")
+
+
+# ---------------------------------------------------------------------------
+# OpenVINO backend-selector prefixes (consistency-vs-IR support)
+# ---------------------------------------------------------------------------
+def test_model_wrapper_openvino_prefix_parses_lazily(tmp_path):
+    """A prefixed wrapper constructs without loading the IR.
+
+    Compilation is deferred to the first forward so ModelWrapper stays
+    constructible on boxes without the openvino package; only the .xml path
+    itself is checked up front.
+    """
+    from src.consistency import ModelWrapper
+
+    xml = tmp_path / "yolov8s_openvino.xml"
+    xml.touch()
+
+    for prefix in ("openvino:", "openvino_int8:"):
+        w = ModelWrapper(f"{prefix}{xml}", "cpu")
+        assert w.type == "openvino"
+        assert w.model is None           # not compiled yet — lazy
+        assert w.model_path == str(xml)  # prefix stripped
+
+
+def test_model_wrapper_openvino_missing_ir_fails_fast():
+    """A typo'd IR path fails at construction with FileNotFoundError."""
+    from src.consistency import ModelWrapper
+
+    with pytest.raises(FileNotFoundError):
+        ModelWrapper("openvino:/no/such/model.xml", "cpu")
+
+
+def test_model_wrapper_openvino_forward_requires_openvino(monkeypatch, tmp_path):
+    """Forward without openvino installed raises the install-hint ImportError
+    (same contract as benchmark._run_openvino)."""
+    import torch
+
+    xml = tmp_path / "yolov8s_openvino.xml"
+    xml.touch()
+
+    monkeypatch.setattr("src.openvino_available", lambda: False)
+    from src.consistency import ModelWrapper
+
+    w = ModelWrapper(f"openvino:{xml}", "cpu")
+    with pytest.raises(ImportError, match="requirements-openvino"):
+        w.forward(torch.zeros(1, 3, 8, 8))
+
+
+def test_resolve_consistency_model_prefix_passthrough(tmp_path):
+    """Prefixed specs pass through verbatim (ModelWrapper parses them);
+    plain paths and defaults resolve like any other path arg."""
+    from pathlib import Path
+
+    from cli.consistency import _resolve_consistency_model
+
+    real = tmp_path / "yolov8s.pt"
+    real.touch()
+
+    spec = "openvino_int8:models/yolov8s_openvino_int8.xml"
+    assert _resolve_consistency_model(spec, str(real)) == spec
+    assert _resolve_consistency_model(str(real), str(real)) == str(real)
+    assert Path(_resolve_consistency_model(None, str(real))) == real
+
+
+def test_model_wrapper_prepare_validates_imgsz_list(monkeypatch, tmp_path):
+    """prepare() compiles the IR before the measurement loop and rejects an
+    img-sizes list the IR cannot serve with a run-level ValueError (the
+    measurement loop itself only reports batch-level failures)."""
+    xml = tmp_path / "yolov8s_openvino.xml"
+    xml.touch()
+
+    monkeypatch.setattr("src.openvino_available", lambda: True)
+
+    class _StubEngine:
+        """Stands in for OpenVINOEngine: construction records the imgsz;
+        spatial_size reports the IR's conversion-pinned size."""
+
+        def __init__(self, model_path, device, imgsz):
+            self.imgsz = imgsz
+            self.spatial_size = 640
+
+    monkeypatch.setattr("src.OpenVINOEngine", _StubEngine)
+
+    from src.consistency import ModelWrapper
+
+    w = ModelWrapper(f"openvino:{xml}", "cpu")
+    w.prepare([640])  # every requested size servable — compiles, no error
+    assert isinstance(w.model, _StubEngine)
+
+    # The engine rejects a mismatched FIRST size at construction; prepare's
+    # own check covers a mismatched LATER size in the (already compiled) list.
+    with pytest.raises(ValueError, match="imgsz=640"):
+        w.prepare([640, 480])
+
+
+def test_model_wrapper_prepare_skips_size_check_for_dynamic_ir(
+    monkeypatch, tmp_path,
+):
+    """A dynamically-shaped IR accepts any img size — prepare must not
+    reject it (only conversion-pinned static spatial dims are validated)."""
+    xml = tmp_path / "yolov8s_openvino.xml"
+    xml.touch()
+
+    monkeypatch.setattr("src.openvino_available", lambda: True)
+
+    class _StubEngine:
+        def __init__(self, model_path, device, imgsz):
+            self.spatial_size = None  # dynamic spatial dims
+
+    monkeypatch.setattr("src.OpenVINOEngine", _StubEngine)
+
+    from src.consistency import ModelWrapper
+
+    w = ModelWrapper(f"openvino:{xml}", "cpu")
+    w.prepare([480, 640])  # no ValueError — dynamic IR serves any size
+    assert w.model is not None
+
+
+def test_model_wrapper_bare_ir_path_hints_at_prefix(tmp_path):
+    """A bare .xml path (missing the openvino: backend selector) fails
+    with the prefix hint, not an opaque ORT InvalidProtobuf."""
+    from src.consistency import ModelWrapper
+
+    xml = tmp_path / "yolov8s_openvino.xml"
+    xml.touch()
+
+    with pytest.raises(ValueError, match="openvino:"):
+        ModelWrapper(str(xml), "cpu")

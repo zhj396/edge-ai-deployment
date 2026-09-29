@@ -101,14 +101,59 @@ def ort_forward(
 class ModelWrapper:
     """Unified interface for PyTorch and ONNX models."""
 
-    def __init__(self, model_path: str, device: str) -> None:
+    # Backend-selector prefixes accepted in addition to plain model paths,
+    # mirroring benchmark's backend labels. ``openvino_int8:`` shares the
+    # whole lazy-load + .xml-check + forward code path with ``openvino:``:
+    # the IR's precision is opaque to ModelWrapper (the FP16 IR and the
+    # NNCF INT8 IR load and forward identically — which one you compare
+    # against is decided by the file you point at, not the prefix). It is a
+    # separate prefix only so the CLI help can tell INT8 paths from FP
+    # paths at a glance.
+    OPENVINO_PREFIX = "openvino:"
+    OPENVINO_INT8_PREFIX = "openvino_int8:"
+
+    def __init__(self, model_path: str, device: str, imgsz: int = 640) -> None:
         self.path = model_path
+        # Engine compile size for the OpenVINO backend: prepare() passes the
+        # run's first requested img size, a bare forward() falls back to this
+        # default. The engine rejects it if the IR's pinned spatial size
+        # disagrees (OpenVINOEngine.spatial_size).
+        self.imgsz = imgsz
+        # Coerce to str so the prefix check works whether the caller passed a
+        # plain str or a pathlib.Path (resolve_path_arg returns Path).
+        m = str(model_path)
         self.device = (
             "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
-        suffix = Path(model_path).suffix.lower()
-        self.type = "pt" if suffix in (".pt", ".pth") else "onnx"
-        self.model = self._load_model()
+        if m.startswith((self.OPENVINO_PREFIX, self.OPENVINO_INT8_PREFIX)):
+            # OpenVINO backend. The IR (.xml + .bin) is compiled LAZILY on
+            # the first forward call: constructing the wrapper requires
+            # only the openvino-free path check below, so the pure-Python
+            # test suite can construct prefixed wrappers on boxes without
+            # openvino (package availability is checked at forward time).
+            # The .xml path is verified up front, with plain pathlib only,
+            # so a typo'd path fails at construction with a clear message.
+            self.type = "openvino"
+            self.model_path = m.split(":", 1)[1]
+            if not Path(self.model_path).exists():
+                raise FileNotFoundError(
+                    f"OpenVINO IR not found: {self.model_path} "
+                    f"(see ARTIFACTS.md for the git-ignored models/)"
+                )
+            self.model = None
+        else:
+            suffix = Path(m).suffix.lower()
+            if suffix in (".xml", ".bin"):
+                # An OpenVINO IR is not an ONNX model: loading it through
+                # ORT fails with an opaque InvalidProtobuf. Point at the
+                # backend selector prefix instead.
+                raise ValueError(
+                    f"{m} is an OpenVINO IR — pass it with a backend "
+                    f"prefix, e.g. openvino:{m} (or openvino_int8:{m})"
+                )
+            self.type = "pt" if suffix in (".pt", ".pth") else "onnx"
+            self.model_path = m
+            self.model = self._load_model()
 
     def _load_model(self):
         if not Path(self.path).exists():
@@ -131,7 +176,88 @@ class ModelWrapper:
     def forward(self, x: torch.Tensor) -> np.ndarray:
         if self.type == "pt":
             return pt_forward(self.model, x)
+        if self.type == "openvino":
+            # Lazy-compile the IR on the first forward (validate_consistency
+            # normally compiles earlier, via prepare()), then reuse the
+            # engine. OpenVINO consumes host numpy; the conversion below
+            # provides it (float32 asserted for parity with ort_forward).
+            if self.model is None:
+                self._compile_openvino(self.imgsz)
+            return self.model._forward(
+                x.detach().cpu().numpy().astype(np.float32)
+            )
         return ort_forward(self.model, x, self.device)
+
+    def _compile_openvino(self, imgsz: int) -> None:
+        """Build the ``OpenVINOEngine`` behind a prefixed wrapper.
+
+        Kept separate from ``forward`` so ``prepare`` can compile eagerly
+        (before any measurement loop) while a bare library caller still
+        compiles lazily on its first forward. The device comes from
+        OPENVINO_DEVICE (default CPU) — the same env-var posture as
+        ``src/benchmark.py::_run_openvino``. ``--device`` is NOT consulted
+        for the OpenVINO side: a ``--device cuda`` run compares ORT-CUDA
+        against OpenVINO-<OPENVINO_DEVICE>, i.e. a cross-device comparison —
+        valid, but it must be a deliberate choice.
+        """
+        from . import openvino_available
+        if not openvino_available():
+            raise ImportError(
+                "openvino is not installed. Run: "
+                "pip install -r requirements-openvino.txt"
+            )
+        from . import OpenVINOEngine
+        ov_device = os.environ.get("OPENVINO_DEVICE", "CPU")
+        self.model = OpenVINOEngine(
+            model_path=self.model_path, device=ov_device, imgsz=imgsz,
+        )
+
+    def prepare(self, img_sizes: Optional[List[int]] = None) -> None:
+        """Compile the OpenVINO IR eagerly; no-op for the pt/onnx backends.
+
+        ``validate_consistency`` calls this before its measurement loop,
+        whose per-batch exception handler reports batch-level failures —
+        configuration errors are raised here, at run level. The engine
+        rejects a mismatched *first* size at construction (see
+        ``OpenVINOEngine.spatial_size``); the check below covers a later
+        size in the list the already-compiled engine cannot serve.
+        """
+        if self.type != "openvino":
+            return
+        if self.model is None:
+            self._compile_openvino(img_sizes[0] if img_sizes else self.imgsz)
+        spatial = self.model.spatial_size
+        if spatial is None or not img_sizes:
+            return  # dynamically-shaped IR — any size is servable
+        bad = sorted({s for s in img_sizes if s != spatial})
+        if bad:
+            raise ValueError(
+                f"OpenVINO IR {self.model_path} was converted for "
+                f"imgsz={spatial} (spatial dims are pinned at conversion "
+                f"— see docs/OPENVINO.md) and cannot serve {bad}. Drop "
+                f"them from the requested img sizes or re-convert the IR."
+            )
+
+
+def _openvino_provenance(*wrappers: "ModelWrapper") -> Dict:
+    """Per-openvino-model device provenance for the consistency report.
+
+    An unservable ``OPENVINO_DEVICE`` request resolves inside the engine to
+    a warned CPU fallback; ``engine.device`` records what actually ran, and
+    the report records both. ``actual_device`` is None only when the
+    wrapper was neither prepared nor forwarded; ``validate_consistency``
+    prepares both wrappers before the loop, so the CLI path always records it.
+    """
+    info: Dict = {}
+    for i, w in enumerate(wrappers, 1):
+        if w.type != "openvino":
+            continue
+        info[f"model{i}_openvino"] = {
+            "model_path": str(w.model_path),
+            "requested_device": os.environ.get("OPENVINO_DEVICE", "CPU"),
+            "actual_device": getattr(w.model, "device", None),
+        }
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +335,23 @@ def validate_consistency(
 
     logger.info("=" * 60)
     logger.info("YOLOv8s Consistency Validation")
-    logger.info("Model1: %s", Path(model1).name)
-    logger.info("Model2: %s", Path(model2).name)
+    logger.info("Model1: %s", model1)
+    logger.info("Model2: %s", model2)
     logger.info("Mode: %s | Device: %s", mode, device)
 
     model_obj1 = ModelWrapper(model1, device)
     model_obj2 = ModelWrapper(model2, device)
+
+    img_sizes = img_sizes or [640]
+
+    # Compile any OpenVINO IR *before* the measurement loop. The loop's
+    # per-batch exception handler reports batch-level failures, so a
+    # missing openvino install, an unservable OPENVINO_DEVICE, or an
+    # --img-sizes value the IR cannot serve (spatial dims are pinned at
+    # conversion — docs/OPENVINO.md) is raised here, failing the whole
+    # run with the offending size named.
+    for w in (model_obj1, model_obj2):
+        w.prepare(img_sizes)
 
     data_yaml = Path(imgs_input) / "data.yaml"
     if not data_yaml.exists():
@@ -237,7 +374,6 @@ def validate_consistency(
 
     logger.info("Loaded %d images", len(imgs))
 
-    img_sizes = img_sizes or [640]
     batch_sizes = batch_sizes or [1, 4, 8, 16]
 
     results: List[Dict] = []
@@ -391,12 +527,24 @@ def validate_consistency(
 
             results.append(summary)
             # Write incrementally so a crash mid-run keeps partial results.
-            atomic_json_dump({"results": results, "mode": mode}, report_path)
+            atomic_json_dump(
+                {
+                    "results": results,
+                    "mode": mode,
+                    **_openvino_provenance(model_obj1, model_obj2),
+                },
+                report_path,
+            )
 
             logger.info("fail_rate=%.2f%%", summary["fail_rate"] * 100)
 
     overall_pass = all(r["overall_status"] == "PASS" for r in results)
-    final_result = {"results": results, "overall_pass": overall_pass, "mode": mode}
+    final_result = {
+        "results": results,
+        "overall_pass": overall_pass,
+        "mode": mode,
+        **_openvino_provenance(model_obj1, model_obj2),
+    }
 
     logger.info("=" * 60)
     logger.info("Consistency validation %s", "PASS" if overall_pass else "FAIL")

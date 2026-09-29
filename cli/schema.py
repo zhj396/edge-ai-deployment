@@ -66,8 +66,10 @@ class BenchmarkConfig:
 
 @dataclass
 class ConsistencyConfig:
-    model1: Path
-    model2: Path
+    # str, not Path: --model1/--model2 may carry an ``openvino(_int8):``
+    # backend-selector prefix (see cli/consistency.py).
+    model1: Union[str, Path]
+    model2: Union[str, Path]
     imgs_input: Union[str, Path]
     mode: str
     max_images: int
