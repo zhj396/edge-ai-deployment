@@ -109,6 +109,7 @@ edge-ai-deployment/
 │   ├── TRAINING.md            # Training narrative: subset build, analysis, staged long-tail
 │   ├── OPENVINO.md            # OpenVINO backend: convert, NNCF INT8, devices, benchmarking
 │   ├── DOCKER.md              # Docker toolchain + server images
+│   └── ORT_CPP.md             # C++ ONNX Runtime backend (cpp/ tree)
 │
 ├── cpp/                       # Standalone C++ ONNX Runtime backend (see docs/ORT_CPP.md)
 │   ├── common/                # Backend-agnostic core: letterbox, NMS decode, class names (no ORT dep)
