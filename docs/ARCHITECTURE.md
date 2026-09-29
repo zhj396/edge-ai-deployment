@@ -673,9 +673,36 @@ Three principles:
    configuration; INT8 inference is validated on the CPU EP, and re-validating CUDA INT8 against a
    newer ORT-gpu is future work.
 
-mAP columns are per-class means (`results/<backend>_perclass.csv`); ultralytics' instance-weighted
-"all" row for PT/FP32 is **0.601 / 0.411** — identical to the training-side record ([TRAINING.md
-§6](TRAINING.md#6-results)), and the FP32 export reproduces the PT per-class table exactly.
+mAP columns are per-class means (`results/<backend>_perclass_<TS>.csv` on CLI runs); ultralytics'
+instance-weighted "all" row for PT/FP32 is **0.601 / 0.411** — identical to the training-side record
+([TRAINING.md §6](TRAINING.md#6-results)), and the FP32 export reproduces the PT per-class table
+exactly.
+
+**Native-evaluator measurement — all five backends** (2026-09-28; WSL2 Ubuntu on the i5-13420H,
+Python 3.12.3, torch 2.5.1+cpu, onnxruntime 1.26.0, openvino 2026.3.0; speed loop = 14
+sampler-selected val images, batch 1, warmup 10, runs 25; mAP = full 397-image val split at conf
+0.001 / iou 0.7 / max_det 300 through `utils/map_eval`, raw OpenVINO IRs included; ORT rows on
+CPUExecutionProvider, OpenVINO rows on CPU; model configuration — `yolov8s.pt` / `yolov8s_fp32.onnx`
+/ `yolov8s_int8.onnx` / `yolov8s_openvino.xml` (FP16 IR, the `openvino convert` default) /
+`yolov8s_openvino_int8.xml` (NNCF INT8)). **Placeholder — recorded on a working (non-idle) host;
+numbers pending replacement by an idle-host re-measurement.**
+
+| Backend         | mean_latency (ms) | p95 (ms) | FPS  | RSS Δ (MB) | mAP50  | mAP50-95 |
+| --------------- | ----------------- | -------- | ---- | ---------- | ------ | -------- |
+| PyTorch         | 2833.0            | 3035.7   | 4.94 | 140.1      | 0.5896 | 0.4016   |
+| ONNX FP32       | 3792.0            | 4060.3   | 3.69 | 214.2      | 0.5896 | 0.4016   |
+| ONNX INT8       | 1978.2            | 2222.6   | 7.08 | 112.9      | 0.5885 | 0.3987   |
+| OpenVINO FP16 IR | 3764.9           | 3990.3   | 3.72 | 435.6      | 0.5896 | 0.4017   |
+| OpenVINO INT8   | 2097.9            | 2172.1   | 6.67 | 148.3      | 0.5895 | 0.3995   |
+
+INT8 speedup on the same runtime: ONNX 1.92× (3792.0 → 1978.2 ms), OpenVINO 1.79× (3764.9 → 2097.9
+ms). INT8 mAP50-95 drop: ONNX QDQ 0.0029 (0.4016 → 0.3987), OpenVINO NNCF 0.0023 (0.40175 → 0.39949)
+— both within the 0.01 budget (closing note below). PyTorch and ONNX FP32 mAP50 agree through 8
+decimals (0.589596683 / 0.589596668). Absolute mAP sits below the Ultralytics-path table above by
+~0.006 (0.4016 vs 0.408 for FP32) — evaluator semantics differ (§8.1 comparability caveat: maxDets
+300 vs 100, no crowd handling); the FP32→INT8 mAP deltas land at 0.0029 vs 0.0026 on the Ultralytics
+path. OpenVINO RSS Δ (435.6 MB) exceeds the ORT rows (214.2 MB FP32) — the OpenVINO runtime
+footprint, a selection factor for memory-constrained targets.
 
 **PT ↔ ONNX FP32** (tensor mode, 91 images, `--atol 1e-4 --rtol 1e-3`): **PASS** — max_diff mean ≈
 0.002, cosine ≈ 1.000 (`results/consistency_report_tensor.json`).
