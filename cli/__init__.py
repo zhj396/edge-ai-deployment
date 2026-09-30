@@ -30,6 +30,9 @@ from .schema import (
     OpenVINOConvertConfig,
     OpenVINOQuantizeConfig,
     OpenVINORunConfig,
+    TensorRTBuildConfig,
+    TensorRTExportConfig,
+    TensorRTRunConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -41,6 +44,8 @@ DEFAULT_MODEL_FP32 = "models/yolov8s_fp32.onnx"
 DEFAULT_MODEL_INT8 = "models/yolov8s_int8.onnx"
 DEFAULT_MODEL_OPENVINO = "models/yolov8s_openvino.xml"
 DEFAULT_MODEL_OPENVINO_INT8 = "models/yolov8s_openvino_int8.xml"
+DEFAULT_MODEL_TENSORRT_FP16 = "models/yolov8s_fp16.engine"
+DEFAULT_MODEL_TENSORRT_INT8 = "models/yolov8s_int8.engine"
 
 # Calibration / validation image directory (must contain data.yaml + images/val).
 DEFAULT_DATA_DIR = "data"
@@ -83,11 +88,16 @@ __all__ = [
     "OpenVINOConvertConfig",
     "OpenVINOQuantizeConfig",
     "OpenVINORunConfig",
+    "TensorRTBuildConfig",
+    "TensorRTExportConfig",
+    "TensorRTRunConfig",
     "DEFAULT_MODEL_PT",
     "DEFAULT_MODEL_FP32",
     "DEFAULT_MODEL_INT8",
     "DEFAULT_MODEL_OPENVINO",
     "DEFAULT_MODEL_OPENVINO_INT8",
+    "DEFAULT_MODEL_TENSORRT_FP16",
+    "DEFAULT_MODEL_TENSORRT_INT8",
     "DEFAULT_DATA_DIR",
     "resolve_path_arg",
     "resolve_model_arg",

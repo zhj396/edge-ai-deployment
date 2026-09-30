@@ -24,7 +24,7 @@ import json
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import imagehash
 import numpy as np
@@ -50,7 +50,7 @@ class CalibrationSampler:
         phash_threshold: int = 5,
         local_weights: Optional[Path] = None,
         seed: int = 42,
-        device: str = "cpu",
+        device: Union[str, int] = "cpu",
         feature_batch_size: int = 32,
         cache_path: Optional[Path] = None,
     ) -> None:
@@ -65,9 +65,19 @@ class CalibrationSampler:
         random.seed(seed)
         np.random.seed(seed)
 
-        self.device = (
-            "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
-        )
+        # Accept "cpu"/"cuda" or an int GPU id (-> cuda:<id>), mirroring
+        # select_providers' int tolerance so callers pass cfg.device directly.
+        if isinstance(device, int) and not isinstance(device, bool):
+            self.device = (
+                f"cuda:{device}"
+                if torch.cuda.is_available()
+                and device < torch.cuda.device_count()
+                else "cpu"
+            )
+        else:
+            self.device = (
+                "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
+            )
         self._load_dataset()
         self._load_feature_extractor()
 

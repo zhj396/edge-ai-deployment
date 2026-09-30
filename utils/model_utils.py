@@ -92,8 +92,14 @@ def inspect_onnx(path: Union[str, Path]) -> OnnxMetadata:
     )
 
 
-def select_providers(device: str) -> List:
+def select_providers(device: Union[str, int]) -> List:
     """ORT provider list, preferring a *tuned* CUDA EP when available.
+
+    Accepts either a mode string (``"cpu"`` / ``"cuda"``) or an **int GPU id**;
+    an int selects CUDA EP on that device (``device_id=<id>``), ``"cuda"`` uses
+    device 0. Centralising the int->CUDA mapping here (invariant #2's single
+    source of truth) lets callers pass a GPU id directly (e.g. the TRT build's
+    ``cfg.device``) without a hardcoded mode string.
 
     The single source of truth for provider selection across the project (engine, benchmark,
     consistency) so that every ORT session runs the same CUDA config and benchmark numbers reflect
@@ -113,12 +119,18 @@ def select_providers(device: str) -> List:
     ``torch.cuda.is_available()``): ORT-gpu may be absent even when torch sees CUDA, and only ORT's
     own list tells us the CUDA EP is actually usable.
     """
-    if device == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
+    if isinstance(device, int) and not isinstance(device, bool):
+        cuda_id = device
+    elif device == "cuda":
+        cuda_id = 0
+    else:
+        cuda_id = None
+    if cuda_id is not None and "CUDAExecutionProvider" in ort.get_available_providers():
         return [
             (
                 "CUDAExecutionProvider",
                 {
-                    "device_id": 0,
+                    "device_id": cuda_id,
                     "arena_extend_strategy": "kNextPowerOfTwo",
                     "cudnn_conv_algo_search": "HEURISTIC",
                     "cudnn_conv_use_max_workspace": "1",

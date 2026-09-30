@@ -1,0 +1,31 @@
+# TensorRT backend — optional. Install ON TOP OF requirements-kaggle.txt
+# (TensorRT is GPU-only; the Kaggle overlay is this repo's validated GPU pin
+# set). This overlay adds the NVIDIA TensorRT runtime + the cuda-python "lean"
+# driver bindings used by the Python build path + inference engine. It is NOT
+# a drop-in replacement for torch/ort.
+#
+#   pip install -r requirements-kaggle.txt
+#   pip install -r requirements-tensorrt.txt
+#
+# Pin rationale: versions are PINNED to the exact set the engine builder,
+# inference engine, and INT8 entropy calibrator are developed + validated
+# against, so an install is reproducible (TensorRT 10.4.0, cuda-python
+# >=12.3.0, Python 3.10-3.12, NVIDIA Tesla T4 sm_75 / CUDA 12.x).
+#
+# * tensorrt==10.4.0 — pinned for the Kaggle T4 (sm_75) environment where
+#   trtexec is unavailable, forcing the programmatic Python-API build path
+#   (trt.Builder + OnnxParser + OptimizationProfile + IInt8EntropyCalibrator2)
+#   that is the project's primary build path and the strong interview story.
+#   TRT 10.x removed the legacy index-based set_binding_address / enqueueV2;
+#   the engine speaks the tensor-name API (set_tensor_address +
+#   execute_async_v3) end-to-end.
+# * cuda-python>=12.3.0 — the cuda.bindings.driver "lean" bindings (CUDA 12.x),
+#   replacing PyCUDA. Every CUDA Driver API call returns a (CUresult, *values)
+#   tuple, normalised through _cuda_call / _cuda_check. Must match the CUDA-12
+#   runtime of the Kaggle environment (CUDA-12.x base image with the
+#   onnxruntime-gpu==1.26.0 CUDA-12 wheel from requirements-kaggle.txt).
+#
+# Both are optional — importing src.tensorrt_* without these installed raises
+# ImportError with a helpful message instead of crashing the toolchain.
+tensorrt==10.4.0
+cuda-python>=12.3.0

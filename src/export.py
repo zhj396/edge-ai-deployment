@@ -66,12 +66,21 @@ def model_export(model_path: Path, output_path: Path, **kwargs):
     """Export YOLOv8 PyTorch model to ONNX FP32 format."""
     model = YOLO(str(model_path))
 
-    if kwargs.get("device", "cpu") == "cuda" and torch.cuda.is_available():
+    # device: "cpu"/"cuda" or an int GPU id (from --device). An int selects
+    # that GPU for the export (ultralytics model.export accepts an int device);
+    # "cuda" -> GPU 0; else CPU. Mirrors select_providers' int tolerance so
+    # callers pass cfg.device directly without a hardcoded "cuda" string.
+    dev = kwargs.get("device", "cpu")
+    if isinstance(dev, int) and not isinstance(dev, bool):
+        device = (
+            dev if torch.cuda.is_available() and dev < torch.cuda.device_count()
+            else "cpu"
+        )
+    elif dev == "cuda" and torch.cuda.is_available():
         device = "cuda"
-        logger.info("Exporting Model ON CUDA")
     else:
         device = "cpu"
-        logger.info("Exporting Model ON CPU")
+    logger.info("Exporting Model ON %s", device)
 
     exported = model.export(
         format="onnx",

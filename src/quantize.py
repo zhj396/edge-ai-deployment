@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import gc
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import onnx
@@ -286,10 +286,18 @@ def quantize_onnx_to_int8(
     max_samples: int = 300,
     method: str = "MinMax",
     resnet50: Optional[Path] = None,
-    device: str = "cpu",
+    device: Union[str, int] = "cpu",
     extra_options: Optional[dict] = None,
+    activation_type: QuantType = QuantType.QUInt8,
 ) -> str:
     """Run static INT8 quantization and write the result to ``onnx_int8_path``.
+
+    ``activation_type`` defaults to ``QUInt8`` (asymmetric, unsigned) — the
+    AVX-VNNI/ARM-NEON ORT-CPU default. Pass ``QInt8`` for a **TensorRT-importable**
+    QDQ model: TRT rejects UINT8 Q/DQ zero-points AND the INT32 bias DequantizeLinear
+    ORT emits by default, so a TRT-bound call must use ``activation_type=QInt8``
+    + ``extra_options={"QuantizeBias": False}`` (bias stays FP32, which TRT folds
+    natively). The head-exclusion scope (``HEAD_NAME_PREFIXES``) is identical.
 
     Steps
     -----
@@ -418,7 +426,7 @@ def quantize_onnx_to_int8(
         model_output=str(int8_path),
         calibration_data_reader=calibrator,
         quant_format=QuantFormat.QDQ,
-        activation_type=QuantType.QUInt8,
+        activation_type=activation_type,
         weight_type=QuantType.QInt8,
         calibrate_method=calib_method,
         calibration_providers=providers,

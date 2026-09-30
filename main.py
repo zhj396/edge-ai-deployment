@@ -15,7 +15,7 @@ import argparse
 import logging
 import sys
 
-from cli import benchmark, consistency, export, infer, inspect, openvino, quantize
+from cli import benchmark, consistency, export, infer, inspect, openvino, quantize, tensorrt
 from src import __version__ as PACKAGE_VERSION
 from utils import get_logger, setup_logging, suppress_third_party_logs
 
@@ -30,6 +30,7 @@ COMMANDS = {
     "consistency": consistency,
     "benchmark": benchmark,
     "openvino": openvino,
+    "tensorrt": tensorrt,
 }
 
 
