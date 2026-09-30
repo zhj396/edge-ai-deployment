@@ -36,6 +36,13 @@ def add_parser(subparsers):
             "--model onnx_int8:models/yolov8s_int8.onnx "
             "--model ort_cpp:models/yolov8s_fp32.onnx "
             "(requires the built ort_cpp exe; see docs/ORT_CPP.md) "
+            "--model tensorrt_fp16:models/yolov8s_fp16.engine "
+            "--model tensorrt_int8:models/yolov8s_int8.engine "
+            "(requires the .engine built via `python main.py tensorrt build`; "
+            "see docs/TENSORRT.md) "
+            "--model trt_cpp_fp16:models/yolov8s_fp16.engine "
+            "(the SAME .engine via the in-process C++ pybind11 backend — build "
+            "the module with `cmake --build cpp/build --target _trt_cpp`) "
             "--model openvino:models/yolov8s_openvino.xml "
             "--model openvino_int8:models/yolov8s_openvino_int8.xml "
             "(openvino device is selected via the OPENVINO_DEVICE env var)"
@@ -94,7 +101,9 @@ def run(args):
             path = path.strip()
 
             if backend not in ["pytorch", "onnx_fp32", "onnx_int8", "ort_cpp",
-                               "openvino", "openvino_int8"]:
+                               "openvino", "openvino_int8",
+                               "tensorrt", "tensorrt_fp16", "tensorrt_int8",
+                               "trt_cpp", "trt_cpp_fp16", "trt_cpp_int8"]:
                 # A bare Windows path ("C:\models\x.onnx") partitions into
                 # backend="C" — point the user at the real problem instead.
                 if len(backend) == 1 and path.startswith(("\\", "/")):
