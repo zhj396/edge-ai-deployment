@@ -707,14 +707,20 @@ footprint, a selection factor for memory-constrained targets.
 **ORT-C++ measurement — FP32, driver benchmark** (2026-09-29; same WSL2 i5-13420H host, ort_cpp
 built on the vendored ORT 1.20.0 SDK, `--intra-op-threads 4` matching the Python single-stream
 posture; speed loop = the same 14 sampler-selected val images cycled for 200 iterations, warmup 3,
-batch 1; latency = driver's own per-iteration wallclock, `results/cpp_bench.json`). mAP and
-consistency rows are not applicable — the driver is a standalone executable and is not wired into
-`utils/map_eval` or the consistency harness (see [docs/ORT_CPP.md](ORT_CPP.md)). **Placeholder —
-recorded on a working (non-idle) host; numbers pending replacement by an idle-host re-measurement.**
+batch 1; latency = driver's own per-iteration wallclock, `results/cpp_bench.json`). The mAP row is
+not applicable — the driver has no Python engine for the native evaluator; the C++ precision signal
+is the consistency harness, reachable through the `ort_cpp:` prefix (full-pipeline comparison,
+[docs/ORT_CPP.md](ORT_CPP.md)). **Placeholder — recorded on a working (non-idle) host; numbers
+pending replacement by an idle-host re-measurement.**
 
 | Backend            | mean_latency (ms) | p50 (ms) | p95 (ms) | FPS  | peak RSS (MB) |
 | ------------------ | ----------------- | -------- | -------- | ---- | ------------- |
 | ort_cpp (ONNX FP32)| 242.9             | 236.8    | 288.6    | 4.12 | 207.7         |
+
+**ORT-C++ consistency — FP32, full-pipeline** (tensor mode, 91 images, `--atol 1e-4 --rtol 1e-3`,
+`--model2 ort_cpp:models/yolov8s_fp32.onnx`): `_TBD_` — idle-host session; the C++ side
+re-letterboxes from the image paths, so this run validates the `cpp/common/` preprocess+forward
+mirror end-to-end against the Python ORT path.
 
 Note the protocol difference from the five-backend block above: the C++ driver times per-iteration
 latency (decode → letterbox → forward → NMS) over a cycled image set, while the Python harness times

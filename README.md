@@ -45,7 +45,7 @@ documented; benchmark figures are tracked in [docs/ARCHITECTURE.md
 
 | Capability                         | What you get                                                                                                   |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| **Multi-backend inference**        | One `infer()` call across `pytorch`, `onnx_fp32`, `onnx_int8`, plus OpenVINO engines (`OpenVINOEngine` / `OpenVINOAsyncEngine`) — all share the same pre/post. A standalone C++ driver (`cpp/`, `docs/ORT_CPP.md`) consumes the same exported ONNX. |
+| **Multi-backend inference**        | One `infer()` call across `pytorch`, `onnx_fp32`, `onnx_int8`, plus OpenVINO engines (`OpenVINOEngine` / `OpenVINOAsyncEngine`) — all share the same pre/post. A standalone C++ driver (`cpp/`, `docs/ORT_CPP.md`) consumes the same exported ONNX and is consistency-tested against the Python path through the `ort_cpp:` prefix. |
 | **YOLOv8 → ONNX export**           | opset 17, dynamic shape by default, ONNX simplifier, runtime-validated session.                                |
 | **Static INT8 PTQ (QDQ)**          | QUInt8 activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL) calibration.               |
 | **Head-aware quantization policy** | The **entire Detect head (`/model.22/`) kept FP32 by name-prefix**; op-type `Sigmoid/Softmax` exclusion as residual fallback. Op-type-only collapses cls scores to 0. |
@@ -393,9 +393,10 @@ implementation in this repo; the mechanics are documented in
 
 ## Limitations & Future Work
 
-* **The C++ driver is a standalone path, not wired into the Python harness** — `cpp/` is not
-  reachable through `infer` / `consistency` / `benchmark`; see [docs/ORT_CPP.md](docs/ORT_CPP.md)
-  (consistency-harness integration section) for the planned adapter shape.
+* **The C++ driver is subprocess-driven, not an in-process backend** — `benchmark` and
+  `consistency` reach it through the `ort_cpp:` prefix (`resolve_ort_cpp_exe`; requires the
+  built exe and the same environment, see [docs/ORT_CPP.md](docs/ORT_CPP.md)); `infer` remains
+  Python-only.
 * **No TensorRT engine export in this repo** — out of scope. The architecture is designed so a
   future `cli/trtexport.py` can plug into `engine.py` the same way `pytorch` and `onnx_*` do.
 * **Static INT8 only.** Dynamic quantization and QAT would each deserve a separate pipeline; the
