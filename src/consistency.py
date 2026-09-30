@@ -134,6 +134,12 @@ class ModelWrapper:
     ORT_CPP_PREFIX = "ort_cpp:"
     OPENVINO_PREFIX = "openvino:"
     OPENVINO_INT8_PREFIX = "openvino_int8:"
+    TENSORRT_PREFIX = "tensorrt:"
+    # ``trt_cpp:`` selects the in-process TensorRT C++ pybind11 accelerator
+    # (the _trt_cpp module). Unlike ``ort_cpp:`` (a subprocess that re-letterboxes
+    # from image PATHS), ``trt_cpp:`` mirrors ``tensorrt:``: it consumes the
+    # already-preprocessed tensor ``x`` and returns the raw head.
+    TRT_CPP_PREFIX = "trt_cpp:"
 
     def __init__(self, model_path: str, device: str, imgsz: int = 640) -> None:
         self.path = model_path
@@ -148,6 +154,17 @@ class ModelWrapper:
         self.device = (
             "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
+        # TRT engine GPU id: a numeric --device (e.g. "1") selects that GPU for
+        # the TensorRTEngine; "cpu"/"cuda" -> GPU 0 (the TRT engine always runs
+        # on GPU). Stored separately from self.device (the "cpu"/"cuda" mode the
+        # ORT reference + preprocess use) so those paths are unchanged by a
+        # numeric --device.
+        if isinstance(device, int) and not isinstance(device, bool):
+            self._trt_gpu_id = device
+        elif isinstance(device, str) and device.isdigit():
+            self._trt_gpu_id = int(device)
+        else:
+            self._trt_gpu_id = 0
         if m.startswith(self.ORT_CPP_PREFIX):
             # C++ backend: the model file is the part after the prefix; the exe
             # is resolved lazily so a wrapper can be constructed without a
@@ -157,6 +174,24 @@ class ModelWrapper:
             self.model_path = m[len(self.ORT_CPP_PREFIX):]
             self.model = None
             self._exe = None
+        elif m.startswith(self.TENSORRT_PREFIX):
+            # TensorRT backend: the engine is deserialized LAZILY on the first
+            # forward call (mirrors how ort_cpp defers exe resolution) so that
+            # constructing the wrapper without TRT installed / without the
+            # .engine staged (CI, the test suite) does not blow up — only an
+            # actual forward call resolves and may raise the helpful error.
+            self.type = "tensorrt"
+            self.model_path = m[len(self.TENSORRT_PREFIX):]
+            self.model = None
+        elif m.startswith(self.TRT_CPP_PREFIX):
+            # TensorRT C++ backend (in-process pybind11 accelerator). Lazy like
+            # tensorrt:/ort_cpp: — the _trt_cpp module is loaded on the first
+            # forward call, so constructing the wrapper without the module built
+            # (CI, the test suite) does not blow up. Consumes the preprocessed
+            # tensor ``x`` (like tensorrt:/onnx, NOT re-preprocess-from-files).
+            self.type = "trt_cpp"
+            self.model_path = m[len(self.TRT_CPP_PREFIX):]
+            self.model = None
         elif m.startswith((self.OPENVINO_PREFIX, self.OPENVINO_INT8_PREFIX)):
             # OpenVINO backend. The IR (.xml + .bin) is compiled LAZILY on
             # the first forward call: constructing the wrapper requires
@@ -217,6 +252,41 @@ class ModelWrapper:
         """
         if self.type == "ort_cpp":
             return self._forward_ort_cpp(paths or [], imgsz or self.imgsz)
+        if self.type == "tensorrt":
+            # Deserialize the .engine on first forward (lazy), then reuse.
+            # TRT consumes the already-preprocessed tensor ``x`` like the onnx
+            # path (not re-preprocess-from-files like ort_cpp).
+            if self.model is None:
+                from . import TensorRTEngine, tensorrt_available
+                if not tensorrt_available():
+                    raise ImportError(
+                        "tensorrt is not installed. Run: "
+                        "pip install -r requirements-tensorrt.txt"
+                    )
+                self.model = TensorRTEngine(
+                    model_path=self.model_path, device=self._trt_gpu_id,
+                    imgsz=self.imgsz,
+                )
+            return self.model.raw_forward(x.detach().cpu().numpy())
+        if self.type == "trt_cpp":
+            # In-process TensorRT C++ pybind11 accelerator. Consumes the
+            # already-preprocessed tensor ``x`` like the Python tensorrt: path
+            # (NOT re-preprocess-from-files like ort_cpp), so it gets native mAP
+            # + kernel_latency_ms — apples-to-apples with tensorrt:. The _trt_cpp
+            # module is loaded LAZILY on the first forward.
+            if self.model is None:
+                from . import TensorRTEngineCpp, trt_cpp_available
+                if not trt_cpp_available():
+                    raise ImportError(
+                        "trt_cpp pybind11 module not built. Build it first: "
+                        "`cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON && "
+                        "cmake --build cpp/build --target _trt_cpp`"
+                    )
+                self.model = TensorRTEngineCpp(
+                    model_path=self.model_path, device=self._trt_gpu_id,
+                    imgsz=self.imgsz,
+                )
+            return self.model.raw_forward(x.detach().cpu().numpy())
         if self.type == "pt":
             return pt_forward(self.model, x)
         if self.type == "openvino":
@@ -496,6 +566,7 @@ def validate_consistency(
             logger.info("\nTest config: imgsz=%d, batch=%d", imgsz, bs)
             batch_results: List[Dict] = []
             failures = 0
+            detection_failures = 0
 
             iterator = range(0, len(imgs), bs)
             for i in tqdm(iterator, desc=f"bs={bs}"):
@@ -517,6 +588,15 @@ def validate_consistency(
                         out1, out2, atol, rtol,
                         cosine_similarity_thresh, mean_diff_thresh,
                         p99_thresh, mode,
+                        # Pass the deployed conf as the cliff so the report surfaces how
+                        # many boxes each side would keep after the conf filter — the metric
+                        # that explains an infer-time detection explosion that the
+                        # box-coord-dominated full-tensor cosine masks. In tensor mode this
+                        # also becomes an authoritative gate: a cross-EP divergence within
+                        # FP32 noise can flip dozens of boxes across this cliff (allclose
+                        # passes, detections explode) — the cliff-flip count is the only
+                        # signal that catches it.
+                        conf_cliff=conf_thres,
                     )
                     stats.update({
                         "imgsz": imgsz,
@@ -598,19 +678,47 @@ def validate_consistency(
 
                     if not stats["passed"]:
                         failures += 1
-                        logger.warning(
-                            "Inconsistent | max_diff=%.6f | cos=%.6f",
-                            stats.get("max_diff"),
-                            stats.get("cosine_similarity"),
+                    # Detection-level verdict — present only in tensor mode (compare_tensors
+                    # sets ``detection_consistent`` when the conf-cliff gate ran). Surfaced
+                    # per-image so a raw-tensor FAIL with a clean cliff reads as the benign
+                    # reduced-precision drift it is, not as a detection regression.
+                    det_c = stats.get("detection_consistent")
+                    if det_c is False:
+                        detection_failures += 1
+                    if "above_cliff_1" in stats:
+                        cliff = (
+                            f" | above_cliff {stats.get('above_cliff_1')}→"
+                            f"{stats.get('above_cliff_2')} "
+                            f"(promoted={stats.get('cliff_promoted_1to2')}, "
+                            f"demoted={stats.get('cliff_demoted_1to2')})"
                         )
-                        if copy_failed_samples:
-                            for p in pre["paths"]:
-                                logger.warning("Failed image: %s", p)
-                                try:
-                                    dst = fail_dir / f"{uuid.uuid4()}_{Path(p).name}"
-                                    shutil.copy(p, dst)
-                                except Exception:
-                                    logger.exception("Failed to copy image")
+                    else:
+                        cliff = ""
+                    if det_c is True:
+                        det_seg = " | detection: CONSISTENT (cliff clean)"
+                    elif det_c is False:
+                        det_seg = " | detection: INCONSISTENT (cliff flip) ← real-regression signal"
+                    else:
+                        det_seg = ""
+                    logger.warning(
+                        "Inconsistent | max_diff=%.6f | cos=%.6f | "
+                        "cls_max_diff=%s%s%s",
+                        stats.get("max_diff"),
+                        stats.get("cosine_similarity"),
+                        ("%.2e" % stats["cls_max_diff"]) if "cls_max_diff" in stats else "n/a",
+                        cliff,
+                        det_seg,
+                    )
+                    if stats.get("error_msg"):
+                        logger.warning("Reason: %s", stats.get("error_msg"))
+                    if copy_failed_samples:
+                        for p in pre["paths"]:
+                            logger.warning("Failed image: %s", p)
+                            try:
+                                dst = fail_dir / f"{uuid.uuid4()}_{Path(p).name}"
+                                shutil.copy(p, dst)
+                            except Exception:
+                                logger.exception("Failed to copy image")
 
                 except Exception:
                     failures += 1
@@ -628,12 +736,22 @@ def validate_consistency(
                 "total_batches": n_attempted,
                 "failures": failures,
                 "fail_rate": failures / n_attempted,
+                # Conf-cliff (detection-level) failure count — tensor mode only. In detection
+                # mode the cliff gate doesn't run (detection judged by per-image IoU/count,
+                # counted in ``failures`` above), so this stays 0 there. Kept separate so a
+                # reduced-precision side that fails raw-tensor allclose but keeps a clean
+                # cliff reports ``fail_rate=100% | detection_fail_rate=0%`` — both truths.
+                "detection_failures": detection_failures,
+                "detection_fail_rate": detection_failures / n_attempted,
                 "overall_status": "PASS" if failures == 0 else "FAIL",
                 "detailed_results": batch_results,
             }
 
             for k in ("max_diff", "mean_diff", "p95", "p99",
-                      "std_diff", "cosine_similarity"):
+                      "std_diff", "cosine_similarity",
+                      "cls_max_diff", "cls_mean_diff", "cls_p99", "cls_cos",
+                      "above_cliff_1", "above_cliff_2",
+                      "cliff_promoted_1to2", "cliff_demoted_1to2"):
                 vals = [s.get(k) for s in batch_results if k in s]
                 if vals:
                     summary[f"{k}_mean"] = float(np.mean(vals))
@@ -649,7 +767,10 @@ def validate_consistency(
                 report_path,
             )
 
-            logger.info("fail_rate=%.2f%%", summary["fail_rate"] * 100)
+            logger.info(
+                "fail_rate=%.2f%% | detection_fail_rate=%.2f%%",
+                summary["fail_rate"] * 100, summary["detection_fail_rate"] * 100,
+            )
 
     overall_pass = all(r["overall_status"] == "PASS" for r in results)
     final_result = {

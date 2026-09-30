@@ -34,6 +34,70 @@ def _safe_pct(arr: np.ndarray, q: float) -> float:
     return float(np.percentile(arr, q))
 
 
+def _infer_nc(out: np.ndarray) -> "int | None":
+    """Infer the class-channel count for a YOLOv8 ``(*, 4+nc, N)`` output.
+
+    YOLOv8 exports as ``(bs, 4+nc, N)`` with the channel dim on axis 1. Box coords occupy the
+    first 4 channels (pixel-scale, large magnitude); class scores occupy channels ``4..4+nc``
+    (post-sigmoid, 0..1). When the channel dim is recoverable we can split the two groups and
+    report the class channel alone — otherwise we bail (a transposed ``(bs, N, 4+nc)`` tensor
+    or a non-3D tensor has no safe split point).
+
+    The channel dim is "axis 1, small, and smaller than axis 2": standard export has
+    ``4+nc=16`` vs ``N=8400``. The ``[5, 64]`` bound rejects obviously-wrong inferences (e.g.
+    a pruned head with >60 classes, or a non-YOLO tensor) — pass ``nc`` explicitly there.
+    """
+    if out.ndim != 3:
+        return None
+    c, n = out.shape[1], out.shape[2]
+    if 5 <= c <= 64 and c < n:
+        return c - 4
+    return None
+
+
+def _class_channel_stats(
+    out1: np.ndarray, out2: np.ndarray, nc: int, conf_cliff: "float | None"
+) -> Dict:
+    """Per-channel-group stats that the full-tensor cosine masks.
+
+    The full-tensor ``cosine_similarity`` is dominated by the 4 box-coord channels (pixel-scale,
+    ~0..640) over the ``nc`` class-score channels (0..1). A divergence that shifts ~1e-3 on
+    class scores can land right on a ``conf`` decision cliff and promote dozens of background
+    boxes to detections, while the full-tensor cosine stays >0.999 — a false-pass in tensor mode.
+    Splitting the class channel out surfaces that divergence directly, and counting boxes above
+    the cliff per side predicts the post-conf-filter detection-count disparity.
+    """
+    cls1 = out1[:, 4:4 + nc, :].astype(np.float64)
+    cls2 = out2[:, 4:4 + nc, :].astype(np.float64)
+    cdiff = np.abs(cls1 - cls2)
+    # Per-box max class score (the value the conf filter actually thresholds).
+    m1 = cls1.max(axis=1)  # (bs, N)
+    m2 = cls2.max(axis=1)
+    stats: Dict = {
+        "cls_max_diff": float(np.max(cdiff)) if cdiff.size else 0.0,
+        "cls_mean_diff": float(np.mean(cdiff)) if cdiff.size else 0.0,
+        "cls_p99": _safe_pct(cdiff, 99),
+        "cls_cos": cosine_similarity(cls1, cls2),
+    }
+    if conf_cliff is not None and conf_cliff > 0:
+        # Expected surviving-box count after the conf filter, per side — the metric that
+        # actually explains an infer-time detection explosion. ``promoted``/``demoted`` are
+        # directional (out1 → out2): boxes the divergence pushed across the cliff relative to
+        # the reference. A near-zero raw-tensor divergence can still flip many boxes here because
+        # the conf threshold sits on the score-distribution's uncertainty mode — a hard cliff that
+        # amplifies FP32-noise-level (≤3.5e-4) cross-EP divergence into a 30× detection-count gap
+        # that ``np.allclose`` cannot see (the divergence is within its tolerance at that value).
+        stats["above_cliff_1"] = int(np.sum(m1 >= conf_cliff))
+        stats["above_cliff_2"] = int(np.sum(m2 >= conf_cliff))
+        stats["cliff_promoted_1to2"] = int(
+            np.sum((m1 < conf_cliff) & (m2 >= conf_cliff))
+        )
+        stats["cliff_demoted_1to2"] = int(
+            np.sum((m1 >= conf_cliff) & (m2 < conf_cliff))
+        )
+    return stats
+
+
 def compare_tensors(
     out1: np.ndarray,
     out2: np.ndarray,
@@ -43,6 +107,9 @@ def compare_tensors(
     mean_diff_thresh: float = 0.01,
     p99_thresh: float = 0.05,
     mode: str = "tensor",
+    nc: "int | None" = None,
+    conf_cliff: "float | None" = None,
+    cliff_count_thresh: float = 5.0,
 ) -> Dict:
     """Compare two raw output tensors. Returns a stats dict with ``passed``.
 
@@ -53,6 +120,29 @@ def compare_tensors(
     * ``detection`` — relaxed: cosine ≥ threshold, mean_diff ≤ threshold,
       p99 ≤ threshold. Advisory in ``detection`` mode — the authoritative
       gate is per-image IoU / class / score (see ``compare_detections``).
+
+    Class-channel diagnostics & the conf-cliff gate (``nc`` / ``conf_cliff``)
+    -----------------------------------------------------------------------
+    When ``nc`` is given (or inferable from a ``(bs, 4+nc, N)`` layout), the class-score
+    channels are split out and reported separately (``cls_max_diff`` / ``cls_cos`` /
+    ``above_cliff_*``). The full-tensor cosine is dominated by the large-magnitude box coords
+    and can mask a class-score divergence small enough to cross a ``conf`` cliff and inflate
+    detection counts — these stats surface it.
+
+    In ``tensor`` mode, when ``conf_cliff`` is set, the cliff gate is **authoritative alongside
+    allclose**: if the per-image box-count flip across the cliff (``max(promoted, demoted) / bs``)
+    exceeds ``cliff_count_thresh``, the comparison FAILS even when allclose passes. This catches
+    the failure mode allclose structurally cannot — a cross-EP numeric divergence within FP32
+    noise (≤3.5e-4 at a 0.25 cliff) that the hard conf threshold amplifies into a spurious
+    detection explosion. ``cliff_count_thresh`` is per-image (normalized by batch size).
+
+    The two verdicts are also exposed **side by side** (``allclose_passed`` /
+    ``detection_consistent``) rather than merged into ``passed``. For a reduced-precision side
+    (FP16/INT8) raw allclose structurally cannot pass at any tolerance that still catches the
+    real regression, yet the cliff gate stays clean — the detections ARE consistent. Reporting
+    both truths (raw FAIL + detection PASS) instead of one merged verdict is the
+    engineering-honest posture: it neither masks the raw divergence nor masks the detection
+    consistency. The composite ``passed`` (allclose AND cliff) stays the strict raw-parity gate.
     """
     stats: Dict = {"passed": False, "status": "FAIL"}
 
@@ -74,12 +164,68 @@ def compare_tensors(
         "cosine_similarity": cosine_similarity(out1, out2),
     })
 
+    # Class-channel diagnostics (informational). Bypassed on a shape mismatch or a
+    # non-YOLOv8 layout — the allclose / advisory gate below is the source of truth for
+    # ``passed``; these fields just make a cliff-amplified divergence visible in the report.
+    resolved_nc = nc if nc is not None else _infer_nc(out1)
+    if resolved_nc is not None and _infer_nc(out2) == resolved_nc:
+        try:
+            stats.update(_class_channel_stats(out1, out2, resolved_nc, conf_cliff))
+            stats["nc"] = resolved_nc
+        except Exception:
+            pass
+
     if mode == "tensor":
+        allclose_ok = True
+        allclose_err = ""
         try:
             np.testing.assert_allclose(out1, out2, atol=atol, rtol=rtol)
-            stats.update({"passed": True, "status": "PASS"})
         except AssertionError as e:
-            stats["error_msg"] = str(e)[:500]
+            allclose_ok = False
+            allclose_err = str(e)[:500]
+
+        # Conf-cliff gate — authoritative in tensor mode alongside allclose. allclose cannot
+        # see a divergence that lives within FP32 noise yet crosses the hard conf threshold
+        # (the divergence is ≤ allclose's own tolerance at the cliff value, so it passes). The
+        # per-image box-count flip across the cliff is the only signal that catches it. On a
+        # stable pair (same EP / CPU) promoted≈demoted≈0; on a cross-EP pair that destabilizes
+        # the cliff it jumps to dozens. ``cliff_count_thresh`` is per image (÷ batch size).
+        cliff_ok = True
+        cliff_err = ""
+        if conf_cliff is not None and "above_cliff_1" in stats:
+            bs = max(out1.shape[0], 1)
+            flip = max(stats["cliff_promoted_1to2"], stats["cliff_demoted_1to2"]) / bs
+            if flip > cliff_count_thresh:
+                cliff_ok = False
+                cliff_err = (
+                    f"conf-cliff destabilized: {flip:.1f} boxes/img flipped across "
+                    f"conf={conf_cliff} (promoted={stats['cliff_promoted_1to2']}, "
+                    f"demoted={stats['cliff_demoted_1to2']}, bs={bs}); "
+                    f"above_cliff {stats['above_cliff_1']}→{stats['above_cliff_2']}. "
+                    f"allclose alone passes (cls_max_diff={stats['cls_max_diff']:.2e}) "
+                    f"because the divergence sits within its tolerance at the cliff value — "
+                    f"expect a spurious-detection explosion at this conf in deployment."
+                )
+
+        # Dual verdict: raw-tensor allclose and the detection-level conf-cliff gate are
+        # reported SIDE BY SIDE, not merged. For a reduced-precision side (FP16/INT8) raw
+        # allclose structurally cannot pass — FP16 box-coord divergence on the head's
+        # unbounded accumulation exceeds any tolerance loose enough to still catch the real
+        # regression — yet the cliff gate stays clean (the detections ARE consistent). Merging
+        # would either mask the raw divergence (cliff-authoritative) or mask the detection
+        # consistency (allclose-authoritative). The composite ``passed`` below stays the
+        # strict raw-parity gate (allclose AND cliff) for back-compat; the two explicit fields
+        # let the report show both truths rather than one misleading PASS/FAIL.
+        stats["allclose_passed"] = allclose_ok
+        if conf_cliff is not None and "above_cliff_1" in stats:
+            stats["detection_consistent"] = cliff_ok
+
+        if allclose_ok and cliff_ok:
+            stats.update({"passed": True, "status": "PASS"})
+        else:
+            stats["passed"] = False
+            stats["status"] = "FAIL"
+            stats["error_msg"] = " | ".join(m for m in (allclose_err, cliff_err) if m)
         return stats
 
     # detection mode — relaxed (advisory; per-image gates decide)

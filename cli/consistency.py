@@ -9,7 +9,16 @@ from . import (
     resolve_path_arg,
     run_timestamp,
 )
+from .consistency_tol import (
+    needs_loose_pair,
+    resolve_tolerances,
+)
 from src import validate_consistency
+
+# Re-exported for back-compat / tests; the implementation lives in consistency_tol
+# so it stays unit-testable without importing ``src`` (ultralytics).
+_needs_loose_pair = needs_loose_pair
+_resolve_tolerances = resolve_tolerances
 
 logger = get_logger(__name__)
 
@@ -23,7 +32,7 @@ def _resolve_consistency_model(arg, default):
     the prefix and resolves the model lazily on the first forward.
     """
     if arg and str(arg).startswith(
-        ("ort_cpp:", "openvino:", "openvino_int8:")
+        ("ort_cpp:", "tensorrt:", "trt_cpp:", "openvino:", "openvino_int8:")
     ):
         return arg
     return resolve_path_arg(arg, default)
@@ -47,15 +56,21 @@ def add_parser(subparsers):
     parser.add_argument(
         "--model1", type=str, default=None,
         help=f"Reference model (default: {DEFAULT_MODEL_PT}). Prefix "
-        f"'ort_cpp:' for the C++ backend (requires the built ort_cpp exe; "
-        f"see docs/ORT_CPP.md), or 'openvino:' / 'openvino_int8:' to compare "
-        f"an OpenVINO IR, e.g. 'openvino_int8:models/yolov8s_openvino_int8.xml' "
+        f"'ort_cpp:' for the C++ ORT backend (requires the built ort_cpp exe; "
+        f"see docs/ORT_CPP.md), 'tensorrt:' to compare a serialized .engine "
+        f"via the TensorRT backend, e.g. "
+        f"'tensorrt:models/yolov8s_fp16.engine'. Prefix 'trt_cpp:' to compare "
+        f"the SAME .engine via the in-process C++ pybind11 backend (build it: "
+        f"cmake --build cpp/build --target _trt_cpp). Prefix 'openvino:' or "
+        f"'openvino_int8:' to compare an OpenVINO IR, e.g. "
+        f"'openvino_int8:models/yolov8s_openvino_int8.xml' "
         f"(OPENVINO_DEVICE env var selects CPU/GPU/AUTO).",
     )
     parser.add_argument(
         "--model2", type=str, default=None,
         help=f"Comparison model (default: {DEFAULT_MODEL_FP32}). Accepts the "
-        f"'ort_cpp:', 'openvino:' and 'openvino_int8:' prefixes like --model1.",
+        f"'ort_cpp:', 'tensorrt:', 'trt_cpp:', 'openvino:' and "
+        f"'openvino_int8:' prefixes like --model1.",
     )
     parser.add_argument(
         "--imgs-input", type=Path, default=None,
@@ -77,12 +92,17 @@ def add_parser(subparsers):
     # above 0.05 via noise in low-confidence boxes (advisory tensor stats only), so the stricter
     # 1e-4 / 1e-3 default would false-fail INT8 runs. Tighten explicitly for PT-vs-FP32.
     parser.add_argument(
-        "--atol", type=float, default=1e-3,
-        help="Absolute tolerance (default: 1e-3 — works for both PT↔FP32 and FP32↔INT8)",
+        # ``default=None`` so argparse never forces a value; ``run()`` auto-selects strict
+        # (1e-4 / 1e-3) for PT↔FP32 and loose (1e-3 / 1e-2) when a reduced-precision side
+        # (INT8 or FP16) is involved. Set both explicitly to override.
+        "--atol", type=float, default=None,
+        help="Absolute tolerance. Default: auto — 1e-4 (PT↔FP32) / 1e-3 (any INT8 or "
+             "FP16 side).",
     )
     parser.add_argument(
-        "--rtol", type=float, default=1e-2,
-        help="Relative tolerance (default: 1e-2 — works for both PT↔FP32 and FP32↔INT8)",
+        "--rtol", type=float, default=None,
+        help="Relative tolerance. Default: auto — 1e-3 (PT↔FP32) / 1e-2 (any INT8 or "
+             "FP16 side).",
     )
     parser.add_argument(
         "--report-path", type=Path, default="results/consistency_report.json",
@@ -103,6 +123,16 @@ def add_parser(subparsers):
 # Run consistency validation command
 # =========================================================
 def run(args):
+    model1 = _resolve_consistency_model(args.model1, DEFAULT_MODEL_PT)
+    model2 = _resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32)
+    atol, rtol = resolve_tolerances(args.atol, args.rtol, model1, model2)
+    logger.info(
+        "Starting consistency check: %s vs %s | atol=%g rtol=%g%s",
+        Path(str(model1)).name, Path(str(model2)).name, atol, rtol,
+        " (auto: strict PT↔FP32)"
+        if (args.atol is None and not needs_loose_pair(model1, model2))
+        else (" (auto: loose, INT8/FP16 involved)" if args.atol is None else " (explicit)"),
+    )
     # One timestamp per run (see cli.run_timestamp for the format rationale).
     # Insert <ts> between stem and suffix so the file is ``<stem>_<TS>.json``
     # — the documented format and the fail_dir name-replace derivation in
@@ -112,8 +142,8 @@ def run(args):
         f"{args.report_path.stem}{ts}{args.report_path.suffix}"
     )
     cfg = ConsistencyConfig(
-        model1=_resolve_consistency_model(args.model1, DEFAULT_MODEL_PT),
-        model2=_resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32),
+        model1=model1,
+        model2=model2,
         imgs_input=resolve_path_arg(args.imgs_input, DEFAULT_DATA_DIR),
         mode=args.mode,
         max_images=args.max_images,
@@ -121,14 +151,9 @@ def run(args):
         batch_sizes=args.batch_sizes,
         resnet50=args.resnet50,
         device=args.device,
-        atol=args.atol,
-        rtol=args.rtol,
+        atol=atol,
+        rtol=rtol,
         report_path=report_path,
-    )
-    # Log the full model spec (not Path.name): for prefixed specs the
-    # ``openvino(_int8):`` prefix is the only signal of which backend runs.
-    logger.info(
-        f"Starting consistency check: {cfg.model1} vs {cfg.model2}"
     )
     results = validate_consistency(
         model1=cfg.model1,
