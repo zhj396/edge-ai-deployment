@@ -26,6 +26,9 @@ struct CLIArgs {
     // Output
     std::string output;     // --output   file (--image) or dir (--dir/--benchmark)
     std::string save_json;  // --save-json
+    std::string dump_raw_dir;  // --dump-raw-dir  write raw pre-NMS forward tensors
+                               // (.npy per image) for the Python consistency
+                               // harness. Requires --dir; ignores conf/iou/NMS.
 
     // Performance
     int intra_op_threads = 0;  // --intra-op-threads   0 = ORT default (all cores)

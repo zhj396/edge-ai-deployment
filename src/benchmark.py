@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import ctypes
 import gc
+import json
 import os
 import platform
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -41,6 +45,33 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def resolve_ort_cpp_exe() -> str:
+    """Locate the built ORT-C++ backend executable.
+
+    Search order: ``ORT_CPP_PATH`` env var (absolute path to the binary) → the
+    CMake build output at ``cpp/build/onnxruntime/ort_cpp[.exe]`` relative to the
+    repo root. Raises a ``RuntimeError`` pointing at the build command if
+    the binary isn't found — both ``benchmark`` and ``consistency`` call this, so
+    the message is the single place that tells the user to build the C++ side.
+    """
+    env_path = os.environ.get("ORT_CPP_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+
+    exe_name = "ort_cpp.exe" if platform.system() == "Windows" else "ort_cpp"
+    # Repo root = this file's parent's parent (src/ -> edge-ai-deployment/).
+    repo_root = Path(__file__).resolve().parent.parent
+    candidate = repo_root / "cpp" / "build" / "onnxruntime" / exe_name
+    if candidate.is_file():
+        return str(candidate)
+
+    raise RuntimeError(
+        "ORT-C++ backend executable not found. Build it first: "
+        "`cmake --build cpp/build` (or set ORT_CPP_PATH to the binary's "
+        "absolute path). See docs/ORT_CPP.md."
+    )
+
+
 def _make_session_options() -> ort.SessionOptions:
     """Single-stream ORT thread tuning: intra=4, inter=2.
 
@@ -434,6 +465,106 @@ class Benchmark:
             metrics["batch_size"] = eff
         return metrics
 
+    # ort_cpp path
+    def _run_ort_cpp(self, backend: str, model_path: str) -> Dict:
+        """ORT-C++ backend via the built ``ort_cpp`` exe (subprocess).
+
+        The C++ benchmark times ``detect()`` = preprocess + infer + postprocess + NMS — the same
+        scope as the Python ``_timed_end_to_end`` loop, so the headline FPS/latency are
+        comparable with the Python ORT row. It is **single-image** (batch=1): the C++ exe
+        has no batched-forward path, so ``batch_size`` is reported as 1 regardless of
+        ``--batch-size`` (the requested value is kept alongside). The image set is
+        copied into a temp dir with zero-padded names so the C++ ``--dir`` loader iterates the
+        *same* image set as the Python backends, in the same order.
+
+        The C++ exe reports **per-image** mean/percentiles/throughput. The Python rows report
+        **per-sweep** (one sweep = all batches) latency/percentiles. To keep the summary CSV
+        comparable across rows, the C++ per-image numbers are scaled to sweep units
+        (× ``n_images``) for ``mean_total_s`` / ``latency_ms_mean`` / ``p50-p99``; ``fps`` and
+        ``mean_image_s`` are per-image and directly comparable. The sweep-scaled percentiles are
+        an approximation (assumes similar per-image latency across the set).
+        """
+        exe = resolve_ort_cpp_exe()
+        n_images = len(self.speed_imgs)
+        if n_images == 0:
+            raise RuntimeError("No images available for benchmarking")
+
+        self._baseline_memory()  # warm the baseline path for parity (RSS comes from the C++ proc)
+
+        tmp_in = tempfile.mkdtemp(prefix="ort_cpp_bench_in_")
+        out_dir = tempfile.mkdtemp(prefix="ort_cpp_bench_out_")
+        tmp_json = os.path.join(out_dir, "summary.json")
+        try:
+            width = max(6, len(str(n_images - 1)))
+            for i, p in enumerate(self.speed_imgs):
+                ext = Path(str(p)).suffix or ".jpg"
+                shutil.copyfile(str(p), os.path.join(tmp_in, f"{i:0{width}d}{ext}"))
+
+            cmd = [
+                exe,
+                "--benchmark", str(self.runs),
+                "--dir", tmp_in,
+                "--max-images", str(n_images),
+                "-m", model_path,
+                "--imgsz", str(self.imgsz),
+                "--conf", str(self.speed_conf),
+                "--iou", str(self.speed_iou),
+                # Match _make_session_options (intra=4, inter=2) so the C++-vs-Python-ORT
+                # comparison is on the same single-stream thread footing.
+                "--intra-op-threads", str(min(4, os.cpu_count() or 1)),
+                "--inter-op-threads", "2",
+                "--save-json", tmp_json,
+            ]
+            logger.info("ort_cpp cmd: %s", " ".join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ort_cpp benchmark failed (exit {proc.returncode}):\n"
+                    f"stderr: {proc.stderr[-2000:]}"
+                )
+            with open(tmp_json, "r", encoding="utf-8") as f:
+                j = json.load(f)
+
+            mean_ms = float(j.get("mean_ms", 0.0))
+            per_image_s = mean_ms / 1000.0
+            sweep_s = per_image_s * n_images  # one sweep = n_images forwards (batch=1)
+            fps = (1000.0 / mean_ms) if mean_ms > 0 else 0.0
+            # Scale per-image percentiles to sweep units so the CSV columns match the Python rows.
+            sweep = lambda k: float(j.get(k, 0.0)) * n_images  # noqa: E731
+
+            metrics = {
+                "model": os.path.basename(model_path),
+                "backend": backend,
+                "batch_size": 1,
+                "requested_batch_size": self.batch_size,
+                "imgsz": self.imgsz,
+                "num_speed_images": n_images,
+                "mean_total_s": sweep_s,
+                "mean_batch_s": per_image_s,   # batch=1 → per-batch == per-image
+                "mean_image_s": per_image_s,
+                "fps": fps,
+                "latency_ms_mean": mean_ms * n_images,   # sweep latency (matches Python rows)
+                "p50": sweep("p50_ms"),
+                "p90": 0.0,
+                "p95": sweep("p95_ms"),
+                "p99": sweep("p99_ms"),
+                # The C++ process reports absolute peak RSS, not a delta from a pre-load
+                # baseline (it is a separate process). rss_increase_mb=0 — documented.
+                "peak_memory_mb": float(j.get("peak_rss_mb", 0.0)),
+                "rss_increase_mb": 0.0,
+            }
+            logger.info(
+                "%s | img=%.4fs | FPS=%.2f | p50=%.1fms p95=%.1fms p99=%.1fms | "
+                "peak_mem=%.1fMB (per-image → sweep-scaled)",
+                backend, per_image_s, fps,
+                sweep("p50_ms"), sweep("p95_ms"), sweep("p99_ms"),
+                metrics["peak_memory_mb"],
+            )
+            return metrics
+        finally:
+            shutil.rmtree(tmp_in, ignore_errors=True)
+            shutil.rmtree(out_dir, ignore_errors=True)
+
     def _timed_end_to_end(
         self,
         backend: str,
@@ -568,6 +699,8 @@ class Benchmark:
 
             if backend == "pytorch":
                 speed = self._run_pytorch(backend, model_path)
+            elif backend == "ort_cpp":
+                speed = self._run_ort_cpp(backend, model_path)
             elif backend.startswith("openvino"):
                 speed = self._run_openvino(backend, model_path)
             else:

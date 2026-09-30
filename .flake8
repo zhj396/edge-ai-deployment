@@ -9,4 +9,5 @@ exclude =
     models,
     data,
     results,
-    logs
+    logs,
+    cpp/build

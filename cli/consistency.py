@@ -18,11 +18,13 @@ def _resolve_consistency_model(arg, default):
     """Resolve a --model1/--model2 arg, allowing a backend prefix.
 
     A plain path goes through ``resolve_path_arg`` (existing-validation). A
-    prefixed spec (``openvino(_int8):<xml>``) is a backend selector, not a
-    path — pass it through verbatim; ``ModelWrapper`` parses the prefix and
-    resolves the model lazily on the first forward.
+    prefixed spec (``ort_cpp:<onnx>`` / ``openvino(_int8):<xml>``) is a backend
+    selector, not a path — pass it through verbatim; ``ModelWrapper`` parses
+    the prefix and resolves the model lazily on the first forward.
     """
-    if arg and str(arg).startswith(("openvino:", "openvino_int8:")):
+    if arg and str(arg).startswith(
+        ("ort_cpp:", "openvino:", "openvino_int8:")
+    ):
         return arg
     return resolve_path_arg(arg, default)
 
@@ -45,14 +47,15 @@ def add_parser(subparsers):
     parser.add_argument(
         "--model1", type=str, default=None,
         help=f"Reference model (default: {DEFAULT_MODEL_PT}). Prefix "
-        f"'openvino:' or 'openvino_int8:' to compare an OpenVINO IR, "
-        f"e.g. 'openvino_int8:models/yolov8s_openvino_int8.xml' "
+        f"'ort_cpp:' for the C++ backend (requires the built ort_cpp exe; "
+        f"see docs/ORT_CPP.md), or 'openvino:' / 'openvino_int8:' to compare "
+        f"an OpenVINO IR, e.g. 'openvino_int8:models/yolov8s_openvino_int8.xml' "
         f"(OPENVINO_DEVICE env var selects CPU/GPU/AUTO).",
     )
     parser.add_argument(
         "--model2", type=str, default=None,
         help=f"Comparison model (default: {DEFAULT_MODEL_FP32}). Accepts the "
-        f"'openvino:' and 'openvino_int8:' prefixes like --model1.",
+        f"'ort_cpp:', 'openvino:' and 'openvino_int8:' prefixes like --model1.",
     )
     parser.add_argument(
         "--imgs-input", type=Path, default=None,

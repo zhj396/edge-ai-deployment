@@ -120,3 +120,21 @@ std::vector<Detection> YOLOv8::detect(
 const ProfileResult& YOLOv8::profile() const {
     return profile_result_;
 }
+
+Ort::Value YOLOv8::forwardRaw(const cv::Mat& image, PreprocessResult& pre) {
+    // Mirror detect()'s first two stages (preprocess + Run) but skip decode/NMS,
+    // returning the raw output tensor for the consistency harness to compare
+    // against the Python ORT forward. The Ort::Value is moved out — the caller
+    // must read it before the next call (we only keep one output buffer).
+    Ort::Value& input_tensor = preprocessor_.process(image, pre);
+
+    auto output_tensors = session_.Run(
+        run_options_,
+        input_names_ptr_.data(),
+        &input_tensor,
+        1,
+        output_names_ptr_.data(),
+        output_names_ptr_.size()
+    );
+    return std::move(output_tensors[0]);
+}

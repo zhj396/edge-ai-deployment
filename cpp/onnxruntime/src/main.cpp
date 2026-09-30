@@ -4,8 +4,10 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -493,6 +495,118 @@ bool run_directory(
     return true;
 }
 
+// Write a raw ORT output tensor to a NumPy .npy file (little-endian float32).
+// Minimal hand-rolled writer — no numpy dep on the C++ side. The Python
+// consistency wrapper np.load()s these back. Format: 6-byte magic
+// "\x93NUMPY" + 2-byte version (1.0) + 2-byte little-endian header length +
+// ASCII dict header (padded to a 64-byte boundary) + raw float32 data.
+bool write_npy(const std::string& path, const Ort::Value& tensor) {
+    auto info = tensor.GetTensorTypeAndShapeInfo();
+    const auto shape = info.GetShape();  // std::vector<int64_t>
+    const float* data = tensor.GetTensorData<float>();
+
+    size_t count = 1;
+    std::string shape_str = "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) shape_str += ", ";
+        shape_str += std::to_string(shape[i]);
+        if (shape[i] > 0) count *= static_cast<size_t>(shape[i]);
+    }
+    if (shape.size() == 1) shape_str += ",";  // "(N,)" for 1-D
+    shape_str += ")";
+
+    std::string dict =
+        "{'descr': '<f4', 'fortran_order': False, 'shape': " + shape_str + ", }";
+    // Pad so (10 + dict.size() + pad + 1('\n')) % 64 == 0.
+    size_t total = 10 + dict.size() + 1;
+    size_t pad = (64 - (total % 64)) % 64;
+    std::string header = dict + std::string(pad, ' ') + "\n";
+    uint16_t header_len = static_cast<uint16_t>(header.size());
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) {
+        LOG_ERROR("Failed to open .npy for writing: " + path);
+        return false;
+    }
+    out.write("\x93NUMPY", 6);
+    out.write("\x01\x00", 2);  // version 1.0
+    out.write(reinterpret_cast<const char*>(&header_len), 2);
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(data),
+             static_cast<std::streamsize>(count * sizeof(float)));
+    return static_cast<bool>(out);
+}
+
+// --dump-raw-dir mode: load the model ONCE, iterate the (sorted) images in
+// args.dir, run forwardRaw per image, write each raw output to
+// <dump_raw_dir>/<basename>.npy. The Python consistency wrapper stages a temp
+// in-dir with zero-padded names so the sorted order matches its batch order,
+// then loads the .npy files back in sorted order. One process per invocation →
+// the ORT session is loaded once per call (not per image).
+bool run_dump_raw_dir(
+    YOLOv8& detector,
+    const CLIArgs& args
+) {
+    fs::path dir(args.dir);
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+        LOG_ERROR("Directory not found: " + args.dir);
+        return false;
+    }
+    std::vector<fs::path> image_paths;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file(ec) && is_image_extension(entry.path())) {
+            image_paths.push_back(entry.path());
+        }
+    }
+    std::sort(image_paths.begin(), image_paths.end());
+    if (image_paths.empty()) {
+        LOG_ERROR("No images (.jpg/.jpeg/.png/.bmp) found in: " + args.dir);
+        return false;
+    }
+
+    fs::path out_dir(args.dump_raw_dir);
+    fs::create_directories(out_dir, ec);
+
+    // Warmup — first Run() pays for ORT graph opt + thread pool spin-up; don't
+    // let it perturb the first image's output (graph opt is deterministic, but
+    // a cold first run can still differ in rare threading paths).
+    {
+        cv::Mat warm = cv::imread(image_paths.front().string());
+        if (!warm.empty()) {
+            PreprocessResult pre;
+            detector.forwardRaw(warm, pre);
+        }
+    }
+
+    LOG_INFO("=== Dump raw forward ===");
+    LOG_INFO("  in dir   : " + args.dir);
+    LOG_INFO("  out dir  : " + args.dump_raw_dir);
+    LOG_INFO("  images   : " + std::to_string(image_paths.size()));
+
+    for (size_t i = 0; i < image_paths.size(); ++i) {
+        cv::Mat img = cv::imread(image_paths[i].string());
+        if (img.empty()) {
+            LOG_WARN("  skip (unreadable) : " + image_paths[i].filename().string());
+            continue;
+        }
+        PreprocessResult pre;
+        auto out = detector.forwardRaw(img, pre);
+        // <out_dir>/<stem>.npy — zero-padded stems keep sorted order == batch order.
+        fs::path npy = out_dir / (image_paths[i].stem().string() + ".npy");
+        if (!write_npy(npy.string(), out)) {
+            LOG_ERROR("  failed   : " + npy.string());
+            return false;
+        }
+        LOG_INFO("  [" + std::to_string(i + 1) + "/"
+                 + std::to_string(image_paths.size()) + "] "
+                 + image_paths[i].filename().string() + " -> "
+                 + npy.filename().string());
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -541,10 +655,15 @@ int main(int argc, char* argv[]) {
                         args.intra_op_threads, args.inter_op_threads);
 
         bool ok = true;
-        // --benchmark is a modifier checked FIRST: it can combine with --image or
-        // --dir (or fall back to the default sample), so don't let run_single_image
-        // grab it when an image source is also present.
-        if (args.benchmark > 0) {
+        // --dump-raw-dir is checked FIRST: it is a consistency-harness mode that
+        // requires --dir and produces raw forward tensors (no NMS), so it must not
+        // be grabbed by run_directory (which writes annotated images) or run_benchmark.
+        if (!args.dump_raw_dir.empty()) {
+            ok = run_dump_raw_dir(detector, args);
+        } else if (args.benchmark > 0) {
+            // --benchmark is a modifier checked next: it can combine with --image
+            // or --dir (or fall back to the default sample), so don't let
+            // run_single_image grab it when an image source is also present.
             ok = run_benchmark(detector, args);
         } else if (!args.dir.empty()) {
             ok = run_directory(detector, args, class_names);

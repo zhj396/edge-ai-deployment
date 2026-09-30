@@ -5,9 +5,9 @@ YOLOv8s inference driver built on the ONNX Runtime C++ API. C++ can't `import` t
 pipeline, so `cpp/` is an additive tree beside the layered Python package — it does **not**
 replace or reorganize `cli/`+`src/`+`utils/`.
 
-> Unlike the Python backends, the C++ backend is **not** wired into `src/consistency.py`
-> yet. The plan for that is a thin Python wrapper (subprocess or `pybind11`)
-> exposing the C++ forward as a callable — the comparison logic itself is not forked.
+> The C++ backend is driven from the Python harnesses through the `ort_cpp:` prefix —
+> a thin subprocess wrapper exposing the C++ preprocess+forward as the compared callable
+> (see "Harness integration" below); the comparison logic itself is not forked.
 
 ## Layout
 
@@ -148,11 +148,47 @@ would run concurrently against `worker_detectors[k]`, because the shared queue l
 thread grab any task. (ORT `Session::Run` itself is thread-safe; the constraint is the
 per-instance preprocessor buffer + `profile_result_`.)
 
-## Consistency-harness integration (future)
+## Harness integration
 
-`src/consistency.py` compares backends by **forward fn**. Wiring the C++ backend means a
-small Python adapter exposing a forward callable over the C++ preprocess→`Session::Run` path
-(subprocess that reads a raw input tensor and dumps the raw output tensor, or a `pybind11`
-module). The adapter must reuse `common/letterboxInto` for the input (so it matches the
-Python preprocess) and return the **raw** `Ort::Value` (pre-NMS) — `compare_tensors` /
-the conf-cliff gate do the rest. Do **not** fork the comparison logic or thread NMS into it.
+`ort_cpp` is reachable from both Python harnesses through the `ort_cpp:<onnx>` backend
+prefix (a thin subprocess wrapper — the exe and Python must run under the **same**
+environment, both in WSL/Linux or both native Windows; the exe is a native binary, not
+cross-ABI). `resolve_ort_cpp_exe` (`src/benchmark.py`) locates the binary via the
+`ORT_CPP_PATH` env var, falling back to `cpp/build/onnxruntime/ort_cpp`; it raises a
+"build it first" error when neither exists.
+
+### Benchmark (`python main.py benchmark`)
+
+`--model ort_cpp:models/yolov8s_fp32.onnx` stages the speed-test images into a temp dir
+with zero-padded names so the C++ `--dir` loader times the *same* images the Python
+backends timed. The C++ benchmark scope (`detect()` = preprocess + infer + postprocess
++ NMS) matches the Python timed loop; the exe's per-image numbers are mapped into the
+summary CSV (sweep-scaled percentiles; peak RSS reported as an absolute value — the C++
+process has no Python baseline, `rss_increase_mb` is 0). Batch is **1** (the exe has no
+batched-forward path); the requested `--batch-size` is kept alongside. mAP
+`--validation` is unsupported for this backend — there is no Python engine to drive the
+native evaluator; the precision signal for the C++ path is the consistency harness.
+
+### Consistency (`python main.py consistency`)
+
+`--model1 models/yolov8s_fp32.onnx --model2 ort_cpp:models/yolov8s_fp32.onnx` runs the
+**full-pipeline** comparison: the C++ side re-letterboxes from the image paths with its
+own `cpp/common/letterboxInto` (mirroring `src/preprocess.py::letterbox`), so the run
+validates the C++ preprocess+forward mirror end-to-end. The wrapper shells out to `--dump-raw-dir` once per batch, loads the `.npy`
+files back in sorted order, and `np.concatenate`s them to `(bs, C, N)` — the same shape
+`ort_forward` produces, so `compare_tensors` and the detection-mode gates run unchanged.
+Thread tuning (`--intra-op-threads 4 --inter-op-threads 2`) matches the Python session
+options so the FP32-vs-FP32 comparison shares one reduction order.
+
+### `--dump-raw-dir` (the C++ mode the consistency wrapper drives)
+
+```bash
+ort_cpp --dump-raw-dir <out_dir> --dir <in_dir> \
+    -m models/yolov8s_fp32.onnx --imgsz 640 --intra-op-threads 4 --inter-op-threads 2
+```
+
+Loads the model **once**, iterates the (sorted) images in `<in_dir>`, runs
+`YOLOv8::forwardRaw` (letterbox + `Session::Run`, no decode/NMS), and writes each raw
+output to `<out_dir>/<basename>.npy` (little-endian float32, shape `(1, 4+nc, 8400)`).
+The npy writer is hand-rolled (no numpy dep on the C++ side). Requires `--dir`;
+ignores `--conf`/`--iou` (raw output is pre-NMS).

@@ -36,6 +36,17 @@ public:
         float iou_threshold
     );
 
+    // Raw pre-NMS forward: letterbox + HWC->CHW + session.Run, returning the
+    // output Ort::Value (the (1, 4+nc, 8400) tensor before decode/NMS). Used by
+    // the ``--dump-raw-dir`` mode so the Python consistency harness can compare
+    // the C++ *forward tensor* against the Python ORT forward — the project's
+    // cross-backend consistency contract (raw tensors, not post-NMS
+    // detections). Reuses detect()'s first two stages; no postprocess/NMS.
+    // ``pre`` receives the letterbox params so a caller that also wants the
+    // inverse transform has them (the dumper itself doesn't need them, but the
+    // cost is one struct copy).
+    Ort::Value forwardRaw(const cv::Mat& image, PreprocessResult& pre);
+
     const ProfileResult& profile() const;
 
 private:
