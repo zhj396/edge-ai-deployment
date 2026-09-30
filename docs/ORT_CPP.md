@@ -39,10 +39,10 @@ cpp/
 
 **Why the split.** `cpp/common/` has **no ONNX Runtime dependency** — it links only OpenCV
 (+ the yaml parser). The ORT-specific code (session, `Ort::Value` tensor wrapping) lives in
-`cpp/onnxruntime/`. A future `cpp/tensorrt/` backend reuses `cpp/common/` unchanged: it links
-`ort_core_common` and hands `decode_nms` a raw `float*` + shape pulled from a TRT buffer.
-This mirrors the Python project's hook — a *shared preprocess/postprocess core,
-consistency-tested across backends* — and keeps that core single-sourced in C++ too.
+`cpp/onnxruntime/`. The `cpp/tensorrt/` backend (see `docs/TENSORRT.md`) follows the same
+layout: its pybind11 module links `ort_core_common` (the documented shared-core contract),
+keeping the *shared preprocess/postprocess core, consistency-tested across backends*
+single-sourced in C++ too.
 
 **SDK path.** The ONNX Runtime SDK lives at `cpp/third_party/onnxruntime/` — *not*
 `cpp/onnxruntime/`. The latter path is reserved for the backend *source*. `ONNXRUNTIME_DIR`

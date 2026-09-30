@@ -45,7 +45,7 @@ documented; benchmark figures are tracked in [docs/ARCHITECTURE.md
 
 | Capability                         | What you get                                                                                                   |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| **Multi-backend inference**        | One `infer()` call across `pytorch`, `onnx_fp32`, `onnx_int8`, plus OpenVINO engines (`OpenVINOEngine` / `OpenVINOAsyncEngine`) — all share the same pre/post. A standalone C++ driver (`cpp/`, `docs/ORT_CPP.md`) consumes the same exported ONNX and is consistency-tested against the Python path through the `ort_cpp:` prefix. |
+| **Multi-backend inference**        | One `infer()` call across `pytorch`, `onnx_fp32`, `onnx_int8`, plus OpenVINO engines (`OpenVINOEngine` / `OpenVINOAsyncEngine`) and TensorRT (`TensorRTEngine` / `TensorRTEngineCpp`) — all share the same pre/post. A standalone C++ driver (`cpp/`, `docs/ORT_CPP.md`) consumes the same exported ONNX and is consistency-tested against the Python path through the `ort_cpp:` prefix. |
 | **YOLOv8 → ONNX export**           | opset 17, dynamic shape by default, ONNX simplifier, runtime-validated session.                                |
 | **Static INT8 PTQ (QDQ)**          | QUInt8 activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL) calibration.               |
 | **Head-aware quantization policy** | The **entire Detect head (`/model.22/`) kept FP32 by name-prefix**; op-type `Sigmoid/Softmax` exclusion as residual fallback. Op-type-only collapses cls scores to 0. |
@@ -62,7 +62,7 @@ documented; benchmark figures are tracked in [docs/ARCHITECTURE.md
 ```text
 ┌──────────────────────── yolov8s_ort CLI (main.py) ─────────────────────────┐
 │                                                                            │
-│   export │ inspect │ quantize │ infer │ consistency │ benchmark │ openvino   │
+│   export │ inspect │ quantize │ infer │ consistency │ benchmark │ openvino │ tensorrt │
 │                                                                            │
 └────┬────────────┬───────────┬──────────┬───────────┬──────────┬────────────┘
      │            │           │          │           │          │
@@ -101,6 +101,7 @@ edge-ai-deployment/
 ├── requirements-cpu.txt       # CPU overlay: +cpu torch/torchvision wheels, onnxruntime
 ├── requirements-kaggle.txt    # Kaggle T4 overlay: no torch reinstall, no numpy pin
 ├── requirements-openvino.txt  # OpenVINO overlay: openvino + nncf (optional backend)
+├── requirements-tensorrt.txt  # TensorRT overlay: tensorrt + cuda-python (optional GPU backend)
 │
 ├── .github/workflows/ci.yml   # CI: flake8 + pytest on Python 3.11 / 3.12
 │
@@ -108,12 +109,14 @@ edge-ai-deployment/
 │   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
 │   ├── TRAINING.md            # Training narrative: subset build, analysis, staged long-tail
 │   ├── OPENVINO.md            # OpenVINO backend: convert, NNCF INT8, devices, benchmarking
+│   ├── TENSORRT.md            # TensorRT backend: build paths, INT8 QDQ vs calibrator, trt_cpp
 │   ├── DOCKER.md              # Docker toolchain + server images
 │   └── ORT_CPP.md             # C++ ONNX Runtime backend (cpp/ tree)
 │
 ├── cpp/                       # Standalone C++ ONNX Runtime backend (see docs/ORT_CPP.md)
 │   ├── common/                # Backend-agnostic core: letterbox, NMS decode, class names (no ORT dep)
 │   ├── onnxruntime/           # ort_cpp exe: pre/post wrappers, session, worker pool, benchmark
+│   ├── tensorrt/              # Optional in-process TRT C++ pybind11 backend (BUILD_TRT_CPP, docs/TENSORRT.md)
 │   └── third_party/           # Committed ORT SDK tarball + extract helper
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
@@ -126,8 +129,11 @@ edge-ai-deployment/
 │   ├── quantize.py            # `quantize`— ONNX FP32 → INT8 (QDQ)
 │   ├── infer.py               # `infer`   — batch inference + visualization
 │   ├── consistency.py         # `consistency` — two models, tensor or detection mode
+│   ├── consistency_tol.py     # Auto tolerance selector (strict PT↔FP32 / loose INT8-FP16)
 │   ├── benchmark.py           # `benchmark` — p50/p95/p99, FPS, RSS, mAP
-│   └── openvino.py            # `openvino` — convert / quantize (NNCF INT8) / run
+│   ├── openvino.py            # `openvino` — convert / quantize (NNCF INT8) / run
+│   └── tensorrt.py            # `tensorrt` — build / export / run
+│   └── tensorrt.py            # `tensorrt` — build / export / run (GPU, optional dep)
 │
 ├── src/                       # Domain logic
 │   ├── __init__.py
@@ -141,7 +147,10 @@ edge-ai-deployment/
 │   ├── consistency.py         # ModelWrapper + tensor & detection comparison
 │   ├── benchmark.py           # Benchmark class: latency / throughput / memory / mAP
 │   ├── openvino_convert.py    # ONNX → OpenVINO IR + NNCF INT8 quantization
-│   └── openvino_engine.py     # OpenVINOEngine / OpenVINOAsyncEngine (same infer() API)
+│   ├── openvino_engine.py     # OpenVINOEngine / OpenVINOAsyncEngine (same infer() API)
+│   ├── tensorrt_engine.py     # TensorRTEngine (TRT-10 tensor-name API, cuda-python lean bindings)
+│   ├── tensorrt_build.py      # Path A Python-API build + Path B Ultralytics export
+│   └── tensorrt_cpp_engine.py # TensorRTEngineCpp wrapper over the _trt_cpp pybind11 module
 │
 ├── utils/                     # Cross-cutting helpers
 │   ├── __init__.py
@@ -165,6 +174,10 @@ edge-ai-deployment/
     ├── test_openvino_optional_imports.py  # OpenVINO optional-dep + device preflight
     ├── test_cli_openvino_convert.py  # openvino convert ONNX resolution / auto-export
     ├── test_benchmark_map_plumbing.py    # benchmark --validation ↔ map_eval wiring
+    ├── test_ort_cpp_wrapper.py    # ort_cpp exe resolution + consistency wrapper (lazy)
+    ├── test_consistency_tol.py    # Tolerance auto-selector (strict/loose routing)
+    ├── test_tensorrt_optional_imports.py  # TensorRT optional-dep surface (_LAZY, QDQ seam, lazy wrapper)
+    ├── test_trt_cpp_optional_imports.py   # trt_cpp pybind11 optional-dep surface (lazy module load)
     ├── test_preprocess.py     # Letterbox + batcher regressions
     └── test_train_staged_retry.py  # Training retry/resume state machine (self-contained)
 ```
@@ -240,9 +253,10 @@ python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:mod
 | `inspect`     | Print ONNX metadata (sha256, opset, I/O, size, producer).               | `--model` (req) · `--compare`                                                                   |
 | `quantize`    | ONNX FP32 → INT8 (QDQ, **MinMax** or **Entropy** calibration).          | `--model` · `--output` · `--imgs-input` · `--imgsz 640` · `--batch-size 1` · `--method MinMax` · `--max-cal-samples 300` · `--resnet50` · `--device cpu` |
 | `infer`       | End-to-end inference with annotated overlays.                           | `--backend onnx_fp32` · `--model` · `--imgs-input` (req) · `--output-dir` · `--imgsz 640` · `--batch-size 8` · `--conf 0.25` · `--iou 0.45` · `--max-det 300` · `--no-save` |
-| `consistency` | Two-model comparison (`tensor` strict · `detection` relaxed).           | `--model1` · `--model2` (accept `openvino:`/`openvino_int8:` prefixes for OpenVINO IR) · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes` · `--batch-sizes` · `--atol 1e-3` · `--rtol 1e-2` · `--report-path` (per-run `<TS>` inserted) |
-| `benchmark`   | Latency / throughput / memory; optional **mAP** validation (native evaluator over every backend, incl. raw OpenVINO IRs; summary CSV records `mAP50` / `mAP50-95` / `mAP_source`). | `--model backend:path` (repeatable) · `--imgs-input` · `--max-images 16` · `--warmup 10` · `--runs 25` · `--validation` · `--conf-threshold 0.001` · `--iou-threshold 0.7` |
+| `consistency` | Two-model comparison (`tensor` strict · `detection` relaxed).           | `--model1` · `--model2` (accept `openvino:`/`openvino_int8:` prefixes for OpenVINO IR, `tensorrt:`/`trt_cpp:` for TensorRT engines, `ort_cpp:` for the C++ ORT backend) · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes` · `--batch-sizes` · `--atol` (auto: strict PT↔FP32, loose INT8/FP16) · `--rtol` (auto) · `--report-path` (per-run `<TS>` inserted) |
+| `benchmark`   | Latency / throughput / memory; optional **mAP** validation (native evaluator over every Python-driven backend, incl. raw OpenVINO IRs + TRT engines; summary CSV records `mAP50` / `mAP50-95` / `mAP_source`). | `--model backend:path` (repeatable) · `--imgs-input` · `--max-images 16` · `--warmup 10` · `--runs 25` · `--validation` · `--conf-threshold 0.001` · `--iou-threshold 0.7` |
 | `openvino`    | OpenVINO backend entry point: `convert` (ONNX → IR), `quantize` (NNCF INT8), `run` (inference). See [docs/OPENVINO.md](docs/OPENVINO.md). | `convert` · `quantize` · `run` · `--model` · `--output` · `--imgsz 640` · `--fp16` / `--no-fp16` · `--imgs-input` · `--max-cal-samples 300` · `--subset-size 64` · `--smooth-quant` · `--device CPU` · `--num-streams AUTO` · `--max-imgs 32` · `--batch-size 8` |
+| `tensorrt`    | TensorRT backend entry point: `build` (ONNX → engine via the Python API; `--static` for Turing/T4), `export` (`.pt` → engine via Ultralytics), `run` (inference). Optional GPU-only dep (`requirements-tensorrt.txt`). See [docs/TENSORRT.md](docs/TENSORRT.md). | `build` · `export` · `run` · `--model` · `--output` · `--precision fp16` · `--imgsz 640` · `--max-batch 8` · `--static` · `--calib-imgs-input` · `--max-cal-samples 300` · `--calib-method MinMax` · `--device 0` · `--imgs-input` (run) · `--backend python\|cpp` (run) |
 
 ---
 
@@ -328,6 +342,10 @@ Pure-Python unit tests; **no model or GPU required**:
 | `tests/test_openvino_optional_imports.py` | OpenVINO optional-dependency surface: `_LAZY` resolution, `ImportError` without openvino/nncf, device preflight (`validate_device_request` fallback/reject contract), static-batch padding, NNCF SmoothQuant gate (opt-in). |
 | `tests/test_cli_openvino_convert.py` | `openvino convert` ONNX resolution: existing-file pass-through, missing-ONNX auto-export from `.pt` (export-flag parity), missing-both error. |
 | `tests/test_benchmark_map_plumbing.py` | `benchmark --validation` ↔ native evaluator wiring: summary-CSV mAP columns + `mAP_source` provenance, per-class CSV writes. |
+| `tests/test_ort_cpp_wrapper.py` | `ort_cpp` exe resolution (env override, helpful missing-exe error), `ort_cpp:` consistency prefix passthrough, lazy `ModelWrapper` detection. |
+| `tests/test_consistency_tol.py` | Tolerance auto-selector: strict pair for PT↔FP32, loose when an INT8/FP16 stem is involved (incl. behind backend prefixes), explicit overrides, single-tolerance rejection. |
+| `tests/test_tensorrt_optional_imports.py` | TensorRT optional-dependency surface: `_LAZY` resolution, `ImportError` without the wheels, config dataclasses, head-exclusion prefix seam (`_select_head_layer_names`), QDQ detection seam (`_is_qdq_onnx`), `tensorrt:` prefix passthrough + lazy `ModelWrapper` (numeric GPU id). |
+| `tests/test_trt_cpp_optional_imports.py` | trt_cpp pybind11 surface: `_LAZY` resolution, `resolve_trt_cpp_module` (env override, helpful missing-module error), `trt_cpp:` prefix passthrough, lazy `ModelWrapper`, `ImportError` without the built module. |
 | `tests/test_preprocess.py`     | Letterbox + batch preprocessing regressions. |
 | `tests/test_train_staged_retry.py` | Training-side retry/resume state machine — self-contained, no ultralytics.                            |
 
@@ -397,8 +415,10 @@ implementation in this repo; the mechanics are documented in
   `consistency` reach it through the `ort_cpp:` prefix (`resolve_ort_cpp_exe`; requires the
   built exe and the same environment, see [docs/ORT_CPP.md](docs/ORT_CPP.md)); `infer` remains
   Python-only.
-* **No TensorRT engine export in this repo** — out of scope. The architecture is designed so a
-  future `cli/trtexport.py` can plug into `engine.py` the same way `pytorch` and `onnx_*` do.
+* **No TensorRT engine export in this repo** — ~~out of scope~~ **superseded**: the TensorRT
+  backend is now integrated (`cli/tensorrt.py` build/export/run, `src/tensorrt_engine.py`,
+  `docs/TENSORRT.md`), with the in-process C++ pybind11 accelerator (`cpp/tensorrt/`,
+  `trt_cpp:` prefix) as the 7th backend.
 * **Static INT8 only.** Dynamic quantization and QAT would each deserve a separate pipeline; the
   head-exclusion (whole `/model.22/` FP32) would likely need re-tuning for QAT-trained models.
 * **CPU-only measurement bias.** The benchmark records RSS correctly on CPU but doesn't
