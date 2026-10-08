@@ -1,0 +1,19 @@
+# Normalize all text files to LF in the repository and on every checkout,
+# so clones behave identically on Windows/macOS/Linux regardless of the
+# local core.autocrlf setting. Shell scripts stay executable on Linux.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets — never normalize.
+*.png binary
+*.jpg binary
+*.pt binary
+*.onnx binary
+*.xml binary
+*.bin binary
+*.engine binary
+*.tar.gz binary
+*.zip binary
