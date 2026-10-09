@@ -2,6 +2,9 @@
 models/
 data/
 
+# Release-asset staging (uploaded to the GitHub Release, not committed)
+coco12-val.zip
+
 # Generated artifacts
 results/
 runs/
