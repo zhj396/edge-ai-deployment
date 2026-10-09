@@ -1,0 +1,22 @@
+# Core runtime dependencies (shared by CPU and GPU builds)
+# Pinned for reproducibility. Bump deliberately and re-validate.
+
+# --- ML / inference runtime ---
+ultralytics==8.4.114        # YOLO training / export / utils
+onnx==1.18.0                # model load / shape inference (export, inspect, quantize)
+opencv-python==4.10.0.84    # abi3 wheels — valid on Python 3.13
+numpy==2.2.6                # supports Python 3.10-3.13
+tqdm==4.66.4
+pillow==12.3.0
+pandas==2.3.3
+psutil==5.9.8               # RSS measurement (benchmark) — abi3 wheels; also pulled by ultralytics
+pyyaml==6.0.2               # data.yaml parsing (sampler) — also pulled by ultralytics
+imagehash==4.3.1            # phash dedup in CalibrationSampler (quantize / consistency / benchmark)
+
+# --- Development & Testing ---
+black==24.10.0
+isort==5.13.2
+flake8==7.1.0
+pytest==8.3.2
+pytest-cov==5.0.0
+ml_dtypes==0.5.4            # not imported by src — pinned transitive dep of onnxruntime
