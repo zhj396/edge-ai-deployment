@@ -1,0 +1,193 @@
+"""Model utilities — metadata extraction, hash, file size.
+
+Deployment pipelines need to:
+
+* Verify model integrity via SHA-256.
+* Read ONNX metadata (inputs, outputs, opset, producer, IR version).
+* Compare two model files quickly.
+* Report model size.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Union
+
+import onnx
+import onnxruntime as ort
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OnnxMetadata:
+    path: str
+    file_size_mb: float
+    sha256: str
+    opset: int
+    ir_version: int
+    producer_name: str
+    producer_version: str
+    inputs: List[Dict]
+    outputs: List[Dict]
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+def sha256_of_file(path: Union[str, Path], chunk_size: int = 1024 * 1024) -> str:
+    """SHA-256 of a file, streamed so it works on multi-GB models."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_size_mb(path: Union[str, Path]) -> float:
+    return Path(path).stat().st_size / (1024 * 1024)
+
+
+# ---------------------------------------------------------------------------
+def _default_domain_opset(model) -> int:
+    """Opset of the default (``ai.onnx``) domain; -1 when absent.
+
+    ``opset_import`` may carry several domains (``com.microsoft``, ``ai.onnx.training``
+    ...); its first entry is not guaranteed to be the default domain.
+    """
+    for imp in model.opset_import:
+        if imp.domain in ("", "ai.onnx"):
+            return imp.version
+    return -1
+
+
+def inspect_onnx(path: Union[str, Path]) -> OnnxMetadata:
+    """Return a structured view of an ONNX file's metadata."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"ONNX file not found: {p}")
+
+    model = onnx.load(str(p))
+    # Shape inference is best-effort validation: some INT8 QDQ graphs and externally-rewritten
+    # models raise InferenceError even though the model is otherwise valid. Don't let that crash
+    # `inspect` — the metadata below is read from the raw graph, not from the inferred shapes.
+
+    try:
+        onnx.shape_inference.infer_shapes(model)
+    except Exception as e:
+        logger.warning("Shape inference skipped for %s: %s", p, e)
+
+    def _io_info(value_info) -> Dict:
+        shape = []
+        for d in value_info.type.tensor_type.shape.dim:
+            shape.append(d.dim_value if d.dim_value else d.dim_param)
+        dtype = value_info.type.tensor_type.elem_type
+        return {
+            "name": value_info.name,
+            "shape": shape,
+            "dtype": onnx.TensorProto.DataType.Name(dtype),
+        }
+
+    return OnnxMetadata(
+        path=str(p),
+        file_size_mb=round(file_size_mb(p), 3),
+        sha256=sha256_of_file(p),
+        opset=_default_domain_opset(model),
+        ir_version=model.ir_version,
+        producer_name=model.producer_name,
+        producer_version=model.producer_version,
+        inputs=[_io_info(i) for i in model.graph.input],
+        outputs=[_io_info(o) for o in model.graph.output],
+    )
+
+
+def select_providers(device: Union[str, int]) -> List:
+    """ORT provider list, preferring a *tuned* CUDA EP when available.
+
+    Accepts either a mode string (``"cpu"`` / ``"cuda"`` / ``"cuda:<id>"``) or an
+    **int GPU id**; an int selects CUDA EP on that device (``device_id=<id>``),
+    ``"cuda"`` uses device 0, ``"cuda:<id>"`` uses that id. A malformed
+    ``cuda:`` form raises ``ValueError``.
+
+    The CUDA EP carries deployment-tuned options:
+
+    * ``arena_extend_strategy=kNextPowerOfTwo`` — allocator rounds up to power-of-two pool
+    buckets, reducing fragmentation (≤2× RAM cost).
+    * ``cudnn_conv_algo_search=HEURISTIC`` — avoids ``EXHAUSTIVE``'s first-call
+    per-algo benchmarking, trading peak kernel selection for startup time.
+    * ``cudnn_conv_use_max_workspace=1`` — let cuDNN pick large-workspace conv kernels.
+
+    CPU is always included as a fallback so a CUDA-toolkit/driver mismatch degrades gracefully.
+    Availability is checked via ``ort.get_available_providers()``: ORT-gpu may be absent even when
+    torch sees CUDA, and only ORT's own list tells us the CUDA EP is actually usable.
+    """
+    if isinstance(device, int) and not isinstance(device, bool):
+        cuda_id = device
+    elif device == "cuda":
+        cuda_id = 0
+    elif isinstance(device, str) and device.startswith("cuda:"):
+        # "cuda:<id>" selects that GPU. A malformed id raises: an unparsable
+        # CUDA request must not end up on the CPU provider list.
+        try:
+            cuda_id = int(device.split(":", 1)[1])
+        except ValueError:
+            raise ValueError(
+                f"Invalid device {device!r}: expected 'cpu', 'cuda', "
+                "'cuda:<id>', or an int GPU id"
+            ) from None
+    else:
+        cuda_id = None
+    if cuda_id is not None and "CUDAExecutionProvider" in ort.get_available_providers():
+        return [
+            (
+                "CUDAExecutionProvider",
+                {
+                    "device_id": cuda_id,
+                    "arena_extend_strategy": "kNextPowerOfTwo",
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "1",
+                },
+            ),
+            "CPUExecutionProvider",
+        ]
+    return ["CPUExecutionProvider"]
+
+
+def compare_models(path1: Union[str, Path], path2: Union[str, Path]) -> Dict:
+    """Quick side-by-side comparison: size, SHA-256, opset.
+
+    Both paths must point to valid ONNX files. Non-ONNX inputs raise
+    ``onnx.checker.ValidationError`` / protobuf decode errors — caught here and
+    surfaced as ``opset = -1`` so callers can still see the size and hash.
+    """
+    p1, p2 = Path(path1), Path(path2)
+    opset_1, opset_2 = -1, -1
+    try:
+        opset_1 = inspect_onnx(p1).opset
+    except Exception:
+        pass
+    try:
+        opset_2 = inspect_onnx(p2).opset
+    except Exception:
+        pass
+    size_1, size_2 = file_size_mb(p1), file_size_mb(p2)
+    sha_1, sha_2 = sha256_of_file(p1), sha256_of_file(p2)
+    return {
+        "model_1": {
+            "path": str(p1),
+            "size_mb": round(size_1, 3),
+            "sha256": sha_1,
+            "opset": opset_1,
+        },
+        "model_2": {
+            "path": str(p2),
+            "size_mb": round(size_2, 3),
+            "sha256": sha_2,
+            "opset": opset_2,
+        },
+        "size_ratio": round(size_1 / max(size_2, 1e-9), 3),
+        "identical": sha_1 == sha_2,
+    }
