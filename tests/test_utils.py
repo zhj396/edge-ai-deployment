@@ -189,6 +189,67 @@ def test_compare_models_different(tmp_path):
     assert comp["size_ratio"] != 1.0
 
 
+# ---------------------------------------------------------------------------
+def test_version_consistency_across_packages():
+    """src / cli / utils all re-export the same ``__version__`` from src._version.
+
+    Fails if any of the three ``__init__.py`` files stops re-exporting,
+    so the version banner in ``main.py`` and the package attributes
+    cannot disagree.
+    """
+    import src  # noqa: F401  (import-side-effect: src.__version__ set)
+    import cli  # noqa: F401  (cli re-exports from src)
+    import utils  # noqa: F401  (utils re-exports from src)
+    assert src.__version__ == cli.__version__ == utils.__version__
+    assert src.__version__ == "1.0.0"
+    # And the single source of truth should also agree.
+    from src._version import __version__ as canonical
+    assert canonical == src.__version__
+
+
+# ---------------------------------------------------------------------------
+# CLI path validation helpers — the onnx_only suffix guard.
+# ---------------------------------------------------------------------------
+def test_onnx_only_accepts_onnx(tmp_path):
+    """``inspect``'s --model/--compare accept .onnx files; other suffixes
+    (.pt and anything else) are rejected by onnx_only."""
+    from cli.inspect import onnx_only
+
+    good = tmp_path / "x.onnx"
+    good.write_bytes(b"\x08\x07")  # any non-empty bytes; suffix is what we check
+    assert onnx_only(good) == good
+
+
+def test_onnx_only_rejects_pt_file(tmp_path):
+    from cli.inspect import onnx_only
+
+    bad = tmp_path / "y.pt"
+    bad.write_bytes(b"x")
+    with pytest.raises(ValueError, match=r"\.onnx"):
+        onnx_only(bad)
+
+
+def test_onnx_only_rejects_unknown_suffix(tmp_path):
+    from cli.inspect import onnx_only
+
+    bad = tmp_path / "y.weird"
+    bad.write_bytes(b"x")
+    with pytest.raises(ValueError, match=r"\.onnx"):
+        onnx_only(bad)
+
+
+def test_onnx_only_error_survives_argparse(tmp_path):
+    """onnx_only raises PathValidationError (an argparse.ArgumentTypeError),
+    so argparse prints the suffix-specific message verbatim."""
+    from cli.inspect import onnx_only
+    from utils import PathValidationError
+
+    bad = tmp_path / "y.pt"
+    bad.write_bytes(b"x")
+    with pytest.raises(PathValidationError, match=r"\.onnx"):
+        onnx_only(bad)
+
+
 def test_clamp_workers_passes_through_when_safe():
     """Requests within the cap pass through unchanged."""
     from utils.threading import clamp_workers
