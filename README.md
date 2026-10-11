@@ -1,9 +1,10 @@
 # YOLOv8s ONNX Runtime Toolchain
 
 A toolchain for taking a **YOLOv8s** PyTorch checkpoint through ONNX export, ONNX Runtime
-inspection and INT8 quantization, reproducible from a single CLI.
+inspection, INT8 quantization, and ONNX Runtime inference, reproducible from a single CLI.
 
-The currently reproducible commands are **`export`**, **`inspect`**, and **`quantize`**.
+The currently reproducible commands are **`export`**, **`inspect`**, **`quantize`**, and
+**`infer`**.
 
 > The training half — COCO 12-class subset build, dataset analysis, and baseline vs.
 > staged long-tail training that produces `models/yolov8s.pt` — is complete and lives
@@ -28,14 +29,17 @@ The currently reproducible commands are **`export`**, **`inspect`**, and **`quan
 
 | Capability                  | Implementation                                                                                                                                            |
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Multi-backend inference** | `YOLOv8Engine`: one `infer()` API across `pytorch`, `onnx_fp32`, `onnx_int8` × `cpu`/`cuda` — all backends share the same preprocess / post-process pipeline; the `infer` CLI and a `preprocess_imgs`-backed batch loop sit on top. Fixed-shape ONNX inputs are honored: the static batch dim sizes each forward, and a mismatched `imgsz` is rejected at init. |
 | **YOLOv8 → ONNX export**    | opset 17, dynamic shape by default, ONNX simplifier; runtime-validated session (structural check, shape inference, ORT probe incl. dynamic-batch check).  |
 | **ONNX model inspection**   | sha256, file size, opset, I/O names and shapes; optional two-model side-by-side comparison.                                                               |
 | **Static INT8 PTQ (QDQ)**   | `quant_pre_process` → `quantize_static`: QUInt8 asymmetric activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL-divergence) calibration. |
 | **Head-aware quantization policy** | The entire Detect head (`/model.22/`) is kept in FP32 via name-prefix exclusion, resolved to concrete node names from the pre-processed graph; op-type `Sigmoid`/`Softmax` exclusion is the fallback layer for builds that rename head nodes. Quantizing the head cls-logit branch collapsed the post-Sigmoid class scores to zero in the validated YOLOv8s configuration. |
 | **Diverse calibration sampler** | `CalibrationSampler`: sqrt-frequency stratified class quotas (floor 1, greedy trim back to budget) → perceptual-hash dedup → ResNet-50 farthest-first traversal over L2-normalized features. |
-| **Batched preprocessing**   | `preprocess_imgs`: letterbox (aspect-ratio-preserving resize + pad) in a `ThreadPoolExecutor`, BGR→RGB, HWC→CHW, /255 → float32 NCHW batch tensors; the INT8 calibration reader consumes it batch by batch. |
+| **Batched preprocessing**   | `preprocess_imgs`: letterbox (aspect-ratio-preserving resize + pad) in a `ThreadPoolExecutor`, BGR→RGB, HWC→CHW, /255 → float32 NCHW batch tensors; the INT8 calibration reader consumes it batch by batch. `preprocess_frames` takes already-decoded BGR frames through the same per-image core and batch assembly. |
+| **Post-processing**         | `post_process`: NMS via Ultralytics `non_max_suppression`, letterbox→original scale-back via `scale_boxes`, per-image clipping, `[(x1, y1, x2, y2, conf, cls), …]` tuples in original-image coordinates; accepts `np.ndarray` / `torch.Tensor` / list outputs in either `(bs, 4+nc, N)` or `(bs, N, 4+nc)` layout. |
+| **CUDA IO Binding via DLPack** | On CUDA the engine binds the input `torch.Tensor` as an on-device `OrtValue` via DLPack (zero host→device copy) and copies outputs back once per inference; the CPU path is plain numpy `session.run`. Warm-up runs the deployed per-backend/per-device path. |
 | **Path validation**         | `existing_validation` + `PathValidationError` (an `argparse.ArgumentTypeError`, so argparse prints the message verbatim); missing paths under `models/` or `data/` point at [ARTIFACTS.md](ARTIFACTS.md). |
-| **Lazy domain imports**     | `src` resolves domain attributes via PEP 562 `__getattr__`; a bare `import src` stays dependency-light — submodules load on first attribute access. `export` defers its domain import into `run()`; `quantize` binds at module level, so `main.py` startup loads torch / torchvision / onnx / onnxruntime / cv2 / imagehash. Ultralytics stays deferred (loaded only when `export` runs). |
+| **Lazy domain imports**     | `src` resolves domain attributes via PEP 562 `__getattr__`; a bare `import src` stays dependency-light — submodules load on first attribute access. `export` defers its domain import into `run()`; `quantize` and `infer` bind at module level, so `main.py` startup loads torch / torchvision / onnx / onnxruntime / cv2 / imagehash / ultralytics. |
 | **Operational hygiene**     | Rotating file + console logging, third-party logs raised to WARNING, per-module logger names.                                                             |
 
 ---
@@ -47,7 +51,8 @@ main.py  —  command registry + logging setup
   └── cli/<cmd>.py   thin argparse wrappers: add_parser() + run(args)
         └── cli/schema.py   typed @dataclass configs
               └── src/      domain logic: ONNX export + validation,
-                            letterbox preprocessing, INT8 quantization,
+                            letterbox preprocessing, post-processing,
+                            unified inference engine, INT8 quantization,
                             calibration sampler
   utils/   cross-cutting helpers: logging, path validation, I/O, metadata,
            CPU threading, percentiles  (imported from cli/ and src/)
@@ -60,8 +65,10 @@ main.py  —  command registry + logging setup
   callables (`existing_validation`, `onnx_only`).
 * **`src/`** — domain logic: ONNX export with structural validation (onnx.checker, shape inference)
   and a runtime probe through ONNX Runtime; letterbox preprocessing with a thread-pool batcher;
-  static INT8 quantization (calibration reader over `preprocess_imgs` + `quantize_static`);
-  calibration sampler (stratified → phash dedup → farthest-first).
+  post-processing (NMS via Ultralytics + scale-back to original coordinates); a unified inference
+  engine (`YOLOv8Engine`: pytorch / onnx_fp32 / onnx_int8 × cpu / cuda); static INT8 quantization
+  (calibration reader over `preprocess_imgs` + `quantize_static`); calibration sampler
+  (stratified → phash dedup → farthest-first).
 * **`utils/`** — logging (rotating file + console), path validation, image discovery, visualization,
   ONNX metadata + SHA-256, percentiles, CPU-thread configuration.
 * **`tests/`** — unit tests; model-free so they run on any laptop (`test_train_staged_retry.py`
@@ -89,16 +96,19 @@ edge-ai-deployment/
 │
 ├── cli/                       # CLI wrappers + shared dataclass configs
 │   ├── __init__.py            # Shared path defaults
-│   ├── schema.py              # ExportConfig / QuantizeConfig dataclasses
+│   ├── schema.py              # ExportConfig / QuantizeConfig / InferConfig dataclasses
 │   ├── export.py              # `export`  — PyTorch → ONNX FP32
 │   ├── inspect.py             # `inspect` — metadata (path, sha256, opset, I/O)
-│   └── quantize.py            # `quantize`— ONNX FP32 → INT8 (QDQ)
+│   ├── quantize.py            # `quantize`— ONNX FP32 → INT8 (QDQ)
+│   └── infer.py               # `infer`   — batch inference + visualization
 │
 ├── src/                       # Domain logic
 │   ├── __init__.py            # PEP 562 lazy re-exports
 │   ├── _version.py            # Single-source __version__ (src / cli / utils / main)
 │   ├── export.py              # ONNX export + structural/runtime validation
 │   ├── preprocess.py          # letterbox + ThreadPoolExecutor batch tensor assembly
+│   ├── postprocess.py         # NMS via Ultralytics + scale_boxes + clip
+│   ├── engine.py              # Unified YOLOv8Engine (PT / ONNX / INT8 × CPU / CUDA)
 │   ├── quantize.py            # YOLOv8CalibrationDataReader + static QDQ quantization
 │   └── sampler.py             # CalibrationSampler: stratified + phash + farthest-first
 │
@@ -115,6 +125,9 @@ edge-ai-deployment/
 └── tests/                     # Unit tests (no model / GPU required)
     ├── conftest.py            # Adds project root to sys.path; data_dir fixture skips without data/
     ├── test_utils.py          # utils + CLI path-validation regressions
+    ├── test_postprocess.py    # Tensor / ndarray / list inputs, scale-back, clips, layout resolution
+    ├── test_preprocess.py     # Array-backed preprocess_frames: batch contract, file-path parity
+    ├── test_engine_batch.py   # Fixed-batch chunking: even split, pad + keep on a short last chunk
     ├── test_quantize.py       # Calibration-reader regressions (_filter_readable, hash-seed determinism)
     └── test_train_staged_retry.py  # train_staged retry/resume state machine (loaded by file path)
 ```
@@ -169,6 +182,9 @@ python main.py inspect --model models/yolov8s_fp32.onnx
 
 # 3. Quantize FP32 → INT8 (QDQ, MinMax by default)
 python main.py quantize --model models/yolov8s_fp32.onnx --output models/yolov8s_int8.onnx --imgs-input data --max-cal-samples 300 --method MinMax
+
+# 4. Run inference on images and save annotated overlays
+python main.py infer --backend onnx_int8 --model models/yolov8s_int8.onnx --imgs-input data/images/val --output-dir results/predictions/onnx_int8
 ```
 
 ---
@@ -180,6 +196,7 @@ python main.py quantize --model models/yolov8s_fp32.onnx --output models/yolov8s
 | `export` | PyTorch `.pt` → ONNX FP32 (opset **17**, dynamic, onnxslim simplify). | `--model` (req) · `--output` · `--imgsz 640` · `--opset 17` · `--no-dynamic` · `--no-simplify` · `--no-validate` · `--nms` · `--device cpu` |
 | `inspect`| Print ONNX metadata (sha256, opset, I/O, size, producer).  | `--model` (req) · `--compare`                                                                                                              |
 | `quantize`| ONNX FP32 → INT8 (QDQ, **MinMax** or **Entropy** calibration). | `--model` · `--output` · `--imgs-input` · `--imgsz 640` · `--batch-size 1` · `--method MinMax` · `--max-cal-samples 300` · `--resnet50` · `--device cpu` |
+| `infer`   | End-to-end inference with annotated overlays. | `--backend onnx_fp32` · `--model` · `--imgs-input` (req) · `--output-dir` · `--imgsz 640` · `--batch-size 8` · `--conf 0.25` · `--iou 0.45` · `--max-det 300` · `--max-imgs 32` · `--no-save` · `--device cpu` |
 
 ---
 
@@ -193,6 +210,9 @@ Unit tests; **no model or GPU required**:
 
 | Test file             | Coverage                                                                                                                                   |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tests/test_postprocess.py` | `ndarray` / `tensor` / `list` inputs, scale-back, clipping, conf filtering, output types and rounding, layout-resolution regressions (`_ensure_4nc_first`: exact `nc=` mode and the magnitude heuristic). |
+| `tests/test_preprocess.py` | Array-backed `preprocess_frames`: batch-contract layout (float32 NCHW, normalized, synthetic `frame_{i}` paths), pixel-identical parity with the file-backed path on a lossless round-trip, gray/BGRA conversion through the shared core, empty-list raise, `original=True` keeps the un-letterboxed frame. |
+| `tests/test_engine_batch.py` | `_batch_chunks` fixed-batch chunking: even split, short-final-chunk pad + `keep` count, batch-of-one, empty input. |
 | `tests/test_quantize.py` | Calibration-reader regressions: `_filter_readable` keep/drop behavior (garbage / missing / directory), all-unreadable constructor raise, stratified-sampling PYTHONHASHSEED determinism (data-gated). |
 | `tests/test_utils.py` | `cosine_similarity`, `percentiles`/`summarize_runs`, `color_for_class`, `draw_detections`, `existing_validation` (+ `PathValidationError` ARTIFACTS.md hint), `onnx_only` path validation, `sha256_of_file`, `file_size_mb`, `clamp_workers`, `compare_models`, cross-package `__version__` consistency. |
 | `tests/test_train_staged_retry.py` | Staged-training retry/resume state machine (`train/train_staged/utils.py`, loaded by file path). Imports numpy/torch/yaml only; no ultralytics. |
@@ -209,3 +229,9 @@ Unit tests; **no model or GPU required**:
   [Quick Start](#quick-start) commands.
 * **Static INT8 only.** Dynamic quantization and QAT each deserve a separate pipeline; the
   head-exclusion policy (whole `/model.22/` FP32) would need re-tuning for QAT-trained models.
+* **Validated on the YOLOv8s 12-class COCO subset only.** The post-processing layout heuristic
+  (permute to `(bs, 4+nc, N)` when `shape[1] > shape[2]` and `shape[1] > SMALL`) assumes
+  `num_boxes >> 4+nc` — always true for YOLOv8 at 640px (`N=8400`, `4+nc=16`). It cannot
+  disambiguate a model that genuinely outputs `(bs, 4+nc, N)` with `4+nc > N`;
+  `post_process(nc=...)` implements the exact-dim resolution for that case. The engine call
+  sites pass `nc=` explicitly.

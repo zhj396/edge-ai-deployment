@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from src import __version__  # noqa: F401  (re-exported for cli.__version__)
 
-from .schema import ExportConfig, QuantizeConfig
+from .schema import ExportConfig, QuantizeConfig, InferConfig
 
 # ---------------------------------------------------------------------------
 # Documented default model paths. Centralized so a rename only needs to be
@@ -26,6 +26,7 @@ DEFAULT_DATA_DIR = "data"
 __all__ = [
     "ExportConfig",
     "QuantizeConfig",
+    "InferConfig",
     "DEFAULT_MODEL_PT",
     "DEFAULT_MODEL_FP32",
     "DEFAULT_MODEL_INT8",

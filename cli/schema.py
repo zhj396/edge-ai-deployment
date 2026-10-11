@@ -27,3 +27,19 @@ class QuantizeConfig:
     method: str
     resnet50: Optional[Path]
     device: str
+
+
+@dataclass
+class InferConfig:
+    model: Path
+    backend: str
+    imgs_input: Union[str, Path]
+    imgsz: int
+    max_imgs: int
+    batch_size: int
+    conf: float
+    iou: float
+    max_det: int
+    save: bool
+    output_dir: Path
+    device: str
