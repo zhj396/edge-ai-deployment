@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 from dataclasses import dataclass
 
 
@@ -59,3 +59,22 @@ class ConsistencyConfig:
     atol: float
     rtol: float
     report_path: Path
+
+
+@dataclass
+class BenchmarkConfig:
+    model: Dict[str, str]
+    imgs_input: Union[str, Path]
+    imgsz: int
+    max_images: int
+    batch_size: int
+    conf_threshold: float
+    iou_threshold: float
+    speed_conf: float
+    speed_iou: float
+    validation: bool
+    resnet50: Optional[Path]
+    device: str
+    warmup: int
+    runs: int
+    use_sampler: bool

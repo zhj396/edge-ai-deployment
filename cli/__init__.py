@@ -13,7 +13,13 @@ from datetime import datetime
 
 from src import __version__  # noqa: F401  (re-exported for cli.__version__)
 
-from .schema import ExportConfig, QuantizeConfig, InferConfig, ConsistencyConfig
+from .schema import (
+    ExportConfig,
+    QuantizeConfig,
+    InferConfig,
+    ConsistencyConfig,
+    BenchmarkConfig,
+)
 
 # ---------------------------------------------------------------------------
 # Documented default model paths. Centralized so a rename only needs to be
@@ -43,6 +49,7 @@ __all__ = [
     "QuantizeConfig",
     "InferConfig",
     "ConsistencyConfig",
+    "BenchmarkConfig",
     "DEFAULT_MODEL_PT",
     "DEFAULT_MODEL_FP32",
     "DEFAULT_MODEL_INT8",
