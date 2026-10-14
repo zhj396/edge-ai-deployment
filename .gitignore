@@ -1,0 +1,35 @@
+# Edge AI Deployment .gitignore
+models/
+data/
+
+# Generated artifacts
+results/
+runs/
+logs/
+
+# Training artifacts (train/)
+analysis_results/
+embed_cache.npy
+
+# Cache / temp
+*.cache
+*.tmp
+*.pyc
+__pycache__/
+*.pyo
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
