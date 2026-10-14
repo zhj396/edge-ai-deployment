@@ -7,6 +7,8 @@ The pipeline is:
 Both single-image (``preprocess_single``) and batched (``preprocess_imgs``) APIs are exposed. The
 batched variant uses a ``ThreadPoolExecutor`` for the per-image cv2 work; the rest of the pipeline
 (numpy stack, ``torch.from_numpy``, normalization) is single-threaded and runs once per batch.
+``preprocess_frames`` takes already-decoded BGR frames (no file I/O) and shares the same
+per-image core and batch assembly, so file- and array-backed inputs produce identical tensors.
 """
 from __future__ import annotations
 
@@ -94,6 +96,42 @@ def letterbox(
 
 
 # ---------------------------------------------------------------------------
+# Per-image core (shared by the file- and frame-backed paths)
+# ---------------------------------------------------------------------------
+def _preprocess_bgr(
+    img: np.ndarray,
+    imgsz: Union[int, Tuple[int, int]] = 640,
+    original: bool = False,
+    path: Union[str, Path] = "",
+) -> dict:
+    """Letterbox + reformat one decoded BGR image."""
+    # Grayscale / BGRA -> BGR
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[-1] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    orig = img.copy() if original else None
+    orig_shape = img.shape[:2]
+
+    img, ratio, pad = letterbox(img, new_shape=imgsz)
+    pad_left = int(pad[0] / 2)
+    pad_top = int(pad[1] / 2)
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = np.ascontiguousarray(img.transpose(2, 0, 1))
+
+    return {
+        "img": img,
+        "orig_img": orig,
+        "orig_shape": orig_shape,
+        "ratio": ratio,                # (r_w, r_h)
+        "pad": (pad_left, pad_top),    # single-side padding
+        "path": str(path),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Single image
 # ---------------------------------------------------------------------------
 def preprocess_single(
@@ -107,31 +145,7 @@ def preprocess_single(
         img = cv2.imread(str(img_path))
         if img is None:
             raise RuntimeError(f"Cannot read image: {img_path}")
-
-        # Grayscale / BGRA -> BGR
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[-1] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-        orig = img.copy() if original else None
-        orig_shape = img.shape[:2]
-
-        img, ratio, pad = letterbox(img, new_shape=imgsz)
-        pad_left = int(pad[0] / 2)
-        pad_top = int(pad[1] / 2)
-
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = np.ascontiguousarray(img.transpose(2, 0, 1))
-
-        return {
-            "img": img,
-            "orig_img": orig,
-            "orig_shape": orig_shape,
-            "ratio": ratio,                # (r_w, r_h)
-            "pad": (pad_left, pad_top),    # single-side padding
-            "path": str(img_path),
-        }
+        return _preprocess_bgr(img, imgsz=imgsz, original=original, path=img_path)
     except Exception as e:
         logger.error("Preprocessing failed %s: %s", img_path, e, exc_info=False)
         return None
@@ -193,13 +207,20 @@ def preprocess_imgs(
             len(img_paths) - len(valid), len(img_paths),
         )
 
-    # Assemble batch
-    imgs = [r["img"] for r in valid]
-    orig_imgs = [r["orig_img"] for r in valid] if original else []
-    orig_shapes = [r["orig_shape"] for r in valid]
-    ratios = [r["ratio"] for r in valid]
-    pads = [r["pad"] for r in valid]
-    paths = [r["path"] for r in valid]
+    return _assemble_batch(valid, device=device, fp16=fp16, original=original)
+
+
+# ---------------------------------------------------------------------------
+# Batch assembly (shared by the file- and frame-backed paths)
+# ---------------------------------------------------------------------------
+def _assemble_batch(
+    results: List[dict],
+    device: str = "cpu",
+    fp16: bool = False,
+    original: bool = False,
+) -> Dict:
+    """Stack per-image dicts into a float32 NCHW batch tensor on ``device``."""
+    imgs = [r["img"] for r in results]
 
     batch_np = np.stack(imgs, axis=0)  # (B, 3, H, W) uint8
     tensor = torch.from_numpy(batch_np).to(torch.float32)
@@ -226,14 +247,45 @@ def preprocess_imgs(
 
     logger.debug(
         "Preprocessing done | count=%d | shape=%s | dtype=%s | device=%s",
-        len(valid), tuple(tensor.shape), tensor.dtype, actual_device,
+        len(results), tuple(tensor.shape), tensor.dtype, actual_device,
     )
 
     return {
         "images": tensor,
-        "orig_imgs": orig_imgs,
-        "orig_shapes": orig_shapes,
-        "ratios": ratios,
-        "pads": pads,
-        "paths": paths,
+        "orig_imgs": [r["orig_img"] for r in results] if original else [],
+        "orig_shapes": [r["orig_shape"] for r in results],
+        "ratios": [r["ratio"] for r in results],
+        "pads": [r["pad"] for r in results],
+        "paths": [r["path"] for r in results],
     }
+
+
+# ---------------------------------------------------------------------------
+# Batched frames (no file I/O)
+# ---------------------------------------------------------------------------
+def preprocess_frames(
+    frames: List[np.ndarray],
+    imgsz: Union[int, Tuple[int, int]] = 640,
+    device: str = "cpu",
+    original: bool = False,
+    disable_cv2_threading: bool = True,
+) -> Dict:
+    """Preprocess already-decoded BGR frames — no file I/O.
+
+    The output layout is identical to ``preprocess_imgs`` so the same
+    forward / post-process pipeline consumes it. Frames are processed
+    serially; ``path`` entries are synthetic frame identifiers used only
+    when a caller saves annotated overlays.
+    """
+    if not frames:
+        raise ValueError("Frame list cannot be empty")
+
+    if disable_cv2_threading:
+        cv2.setNumThreads(0)
+
+    imgsz_t = check_imgsz(imgsz)
+    results = [
+        _preprocess_bgr(f, imgsz=imgsz_t, original=original, path=f"frame_{i}")
+        for i, f in enumerate(frames)
+    ]
+    return _assemble_batch(results, device=device, fp16=False, original=original)
