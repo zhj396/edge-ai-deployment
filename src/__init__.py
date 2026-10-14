@@ -29,8 +29,11 @@ _LAZY: dict[str, str] = {
     "model_export": ".export",
     "preprocess_single": ".preprocess",
     "preprocess_imgs": ".preprocess",
+    "preprocess_frames": ".preprocess",
+    "post_process": ".postprocess",
     "CalibrationSampler": ".sampler",
     "quantize_onnx_to_int8": ".quantize",
+    "YOLOv8Engine": ".engine",
 }
 
 __all__ = list(_LAZY)
