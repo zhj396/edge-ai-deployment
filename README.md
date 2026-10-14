@@ -102,6 +102,7 @@ edge-ai-deployment/
 ├── pyproject.toml             # black / isort / pytest config
 ├── .flake8                    # flake8 config (flake8 7.x does not read pyproject.toml)
 ├── .gitignore                 # models/, data/, coco12-val.zip, results/, runs/, logs/ stay out of git
+├── .github/workflows/ci.yml   # GitHub Actions: flake8 + pytest on push / PR (Python 3.12 / 3.13)
 ├── requirements.txt           # Core runtime deps (shared CPU/GPU; no torch/ORT) + dev tools
 ├── requirements-cpu.txt       # CPU overlay: +cpu torch/torchvision wheels, onnxruntime
 ├── requirements-kaggle.txt    # GPU overlay: keeps preinstalled CUDA torch; onnxruntime-gpu
@@ -302,6 +303,10 @@ Unit tests; **no model or GPU required**:
 
 `tests/conftest.py` adds the project root to `sys.path` and skips the `data_dir` fixture when
 `data/` is absent (so unit tests don't require the full dataset).
+
+GitHub Actions runs the same two gates on every push to and pull request against `main`:
+`flake8 .` then `pytest -q`, on Python 3.12 / 3.13
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ---
 
