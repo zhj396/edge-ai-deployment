@@ -27,6 +27,10 @@ from ._version import __version__  # noqa: F401  (re-exported for src.__version_
 
 _LAZY: dict[str, str] = {
     "model_export": ".export",
+    "preprocess_single": ".preprocess",
+    "preprocess_imgs": ".preprocess",
+    "CalibrationSampler": ".sampler",
+    "quantize_onnx_to_int8": ".quantize",
 }
 
 __all__ = list(_LAZY)

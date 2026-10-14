@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional, Union
 from dataclasses import dataclass
 
 
@@ -13,3 +14,16 @@ class ExportConfig:
     device: str
     nms: bool
     validate: bool
+
+
+@dataclass
+class QuantizeConfig:
+    model: Path
+    output: Path
+    imgs_input: Union[str, Path]
+    imgsz: int
+    batch_size: int
+    max_cal_samples: int
+    method: str
+    resnet50: Optional[Path]
+    device: str
