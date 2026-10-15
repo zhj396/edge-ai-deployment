@@ -43,3 +43,19 @@ class InferConfig:
     save: bool
     output_dir: Path
     device: str
+
+
+@dataclass
+class ConsistencyConfig:
+    model1: Path
+    model2: Path
+    imgs_input: Union[str, Path]
+    mode: str
+    max_images: int
+    img_sizes: list
+    batch_sizes: list
+    resnet50: Optional[Path]
+    device: str
+    atol: float
+    rtol: float
+    report_path: Path
