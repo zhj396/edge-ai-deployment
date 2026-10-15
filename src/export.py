@@ -69,6 +69,15 @@ def validate_onnx_model(onnx_path: Path, imgsz: int, device: str = "cpu"):
 # =========================================================
 def model_export(model_path: Path, output_path: Path, **kwargs):
     """Export YOLOv8 PyTorch model to ONNX FP32 format."""
+    # Suffix gate: existing_validation accepts .xml/.bin for the openvino
+    # command group; YOLO() consumes a .pt/.pth checkpoint, and a foreign
+    # suffix fails inside ultralytics with an unactionable loader error.
+    if Path(model_path).suffix.lower() not in (".pt", ".pth"):
+        raise ValueError(
+            f"export expects a .pt/.pth checkpoint, got: {model_path}. "
+            f"OpenVINO IR files (.xml/.bin) belong to the `openvino` "
+            f"command group."
+        )
     model = YOLO(str(model_path))
 
     # device: "cpu"/"cuda" or an int GPU index; an int is passed through to

@@ -51,8 +51,8 @@ Key design rules:
   logic in CLI.
 * **Configs are typed.** Every command except `inspect` (two flat flags, no config object) has a
   `@dataclass` in `cli/schema.py` (`ExportConfig`, `QuantizeConfig`, `InferConfig`,
-  `BenchmarkConfig`, `ConsistencyConfig`), which provides typing, validation, and a printable
-  `repr()` for the log.
+  `BenchmarkConfig`, `ConsistencyConfig`, plus the three OpenVINO subcommand configs), which
+  provides typing, validation, and a printable `repr()` for the log.
 * **Logging is centralized.** `utils.logging.setup_logging()` configures the root logger with a
   rotating file + stdout, idempotent under repeat calls; `get_logger(__name__)` everywhere.
 * **`src/` is importable from `cli/` and `tests/`.** No top-level scripts doing heavy lifting;
@@ -561,10 +561,10 @@ For each backend:
 And — when `--validation` is passed — a **per-class mAP** from the backend-agnostic native COCO
 evaluator (`utils/map_eval.py`), driven over each backend's shared `infer()` API (conf=0.001,
 iou=0.7 — the COCO-standard PR-curve config from `--conf-threshold` / `--iou-threshold`). Every
-benchmark backend with a Python engine goes through the same evaluator, so mAP50 / mAP50-95 are
-directly comparable across backends. CLI runs write the per-class rows to
-`results/<backend>_perclass<timestamp>.csv`; the summary CSV records three columns: `mAP50`,
-`mAP50-95`, and `mAP_source`.
+benchmark backend with a Python engine — including raw OpenVINO IRs — goes through the same
+evaluator, so mAP50 / mAP50-95 are directly comparable across backends. CLI runs write the
+per-class rows to `results/<backend>_perclass<timestamp>.csv`; the summary CSV records three
+columns: `mAP50`, `mAP50-95`, and `mAP_source`.
 
 **mAP provenance (`mAP_source`).** Each summary row records *why* its mAP is present or absent:
 `native evaluator` (measured), `unsupported backend (no Python engine to drive)` (a backend

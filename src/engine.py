@@ -134,6 +134,24 @@ class YOLOv8Engine:
 
     # load
     def _load_model(self) -> None:
+        # Suffix gate: existing_validation accepts .xml/.bin for the openvino
+        # command group, so a mispointed --model can reach this engine with a
+        # suffix its loader cannot read — reject it here, with the owning
+        # command group named (YOLO() / InferenceSession fail with an
+        # unactionable loader error).
+        suffix = Path(self.model_path).suffix.lower()
+        if self.backend == "pytorch" and suffix not in (".pt", ".pth"):
+            raise ValueError(
+                f"The pytorch backend expects a .pt/.pth checkpoint, got: "
+                f"{self.model_path}. OpenVINO IR files (.xml/.bin) belong to "
+                f"the `openvino` command group."
+            )
+        if self.backend.startswith("onnx") and suffix != ".onnx":
+            raise ValueError(
+                f"The {self.backend} backend expects an ONNX file (.onnx), "
+                f"got: {self.model_path}. OpenVINO IR files (.xml/.bin) "
+                f"belong to the `openvino` command group."
+            )
         if self.backend == "pytorch":
             self.model = YOLO(self.model_path)
             self.model.to(self.device)

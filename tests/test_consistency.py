@@ -1,11 +1,12 @@
 """Unit tests for comparison helpers.
 
 The comparison-helper tests import ``utils.comparison`` (pure NumPy) and run
-without the ultralytics stack. Two tests here need the heavy stack and skip
-when it is absent: ``test_src_consistency_reexports_comparison_helpers``
-(``src.consistency`` imports ultralytics at module level) and
+without the ultralytics stack. The remaining tests need the heavy stack and
+skip when it is absent: ``test_src_consistency_reexports_comparison_helpers``
+(``src.consistency`` imports ultralytics at module level),
 ``test_consistency_parser_exposes_report_path`` (``cli.consistency`` resolves
-``validate_consistency`` through the same lazy import).
+``validate_consistency`` through the same lazy import), and the OpenVINO
+dispatch tests (they import ``src.consistency`` for ``ModelWrapper``).
 """
 import numpy as np
 import pytest
@@ -163,3 +164,111 @@ def test_consistency_parser_exposes_report_path():
 
     args = parser.parse_args(["consistency", "--report-path", "results/tensor.json"])
     assert args.report_path == Path("results/tensor.json")
+
+
+# ---------------------------------------------------------------------------
+# OpenVINO prefix dispatch (ModelWrapper)
+# ---------------------------------------------------------------------------
+def test_openvino_prefix_strips_head_not_tail():
+    """``spec[len(prefix):]`` removes exactly ``len(prefix)`` characters
+    from the head; the path text stays intact."""
+    pytest.importorskip("ultralytics")
+    from src.consistency import ModelWrapper
+
+    spec = "openvino:models/yolov8s_openvino.xml"
+    prefix = "openvino:"
+    assert spec[len(prefix):] == "models/yolov8s_openvino.xml"
+    # Pin the dispatch constant's contents: each prefix is an exact string
+    # form matched via startswith, so an accidental edit surfaces here.
+    assert ModelWrapper.OPENVINO_PREFIXES == ("openvino_int8:", "openvino:")
+
+
+def test_openvino_missing_xml_fails_fast_with_stripped_path(tmp_path):
+    """A missing IR raises FileNotFoundError naming the real path, before
+    any OpenVINOEngine import is attempted."""
+    pytest.importorskip("ultralytics")
+    from src.consistency import ModelWrapper
+
+    missing = tmp_path / "no_such_ir.xml"
+    with pytest.raises(FileNotFoundError) as ei:
+        ModelWrapper(f"openvino:{missing}", "cpu")
+    assert str(missing) in str(ei.value)
+    assert "openvino:" not in str(ei.value)
+
+
+def test_openvino_non_xml_suffix_rejected(tmp_path):
+    """``openvino:`` + a non-.xml suffix raises PathValidationError naming
+    the actual path, ahead of the lazy engine import."""
+    pytest.importorskip("ultralytics")
+    from src.consistency import ModelWrapper
+    from utils import PathValidationError
+
+    # A stub file satisfies the exists() check; the suffix check fires
+    # before any model content is read.
+    fake = tmp_path / "fake.onnx"
+    fake.write_bytes(b"\x00" * 8)
+    with pytest.raises(PathValidationError):
+        ModelWrapper(f"openvino:{fake}", "cpu")
+
+
+def test_openvino_forward_dispatch_uses_host_numpy():
+    """``ModelWrapper.forward`` on an openvino-type wrapper copies the torch
+    tensor to a host float32 numpy batch before calling ``engine._forward``."""
+    pytest.importorskip("torch")
+    import numpy as np
+    import torch
+
+    from src.consistency import ModelWrapper
+
+    mw = ModelWrapper.__new__(ModelWrapper)
+    mw.type = "openvino"
+
+    class _StubEngine:
+        def _forward(self, batch):
+            assert isinstance(batch, np.ndarray) and batch.dtype == np.float32
+            assert batch.ndim == 4
+            return np.zeros((batch.shape[0], 16, 8400), dtype=np.float32)
+
+    mw.model = _StubEngine()
+    out = ModelWrapper.forward(mw, torch.rand(2, 3, 64, 64))
+    assert out.shape == (2, 16, 8400)
+
+
+def test_openvino_bare_prefix_keeps_empty_stripped_path():
+    """A bare "openvino:" (empty path) keeps the empty stripped path —
+    the prefixed spec must not resurface in self.path / error messages."""
+    pytest.importorskip("ultralytics")
+    from src.consistency import ModelWrapper
+    from utils import PathValidationError
+
+    # Path("") resolves to the cwd (exists() is True), so the empty path
+    # surfaces through the .xml suffix check as a PathValidationError.
+    with pytest.raises((PathValidationError, FileNotFoundError)) as ei:
+        ModelWrapper("openvino:", "cpu")
+    assert "openvino:" not in str(ei.value)
+
+
+def test_consistency_report_includes_openvino_device_provenance():
+    """``validate_consistency`` wires an OpenVINO side's requested/actual
+    device pair into the final report under ``openvino_devices``."""
+    pytest.importorskip("ultralytics")
+    import inspect
+
+    from src import consistency
+
+    src = inspect.getsource(consistency.validate_consistency)
+    assert "openvino_provenance" in src
+    assert '"openvino_devices"' in src
+
+
+def test_consistency_plain_openvino_suffix_rejected(tmp_path):
+    """A bare .xml (no openvino: prefix) routes to the PT/ONNX branch — the
+    suffix gate rejects it there, pointing at the openvino: prefixes."""
+    pytest.importorskip("ultralytics")
+    from src.consistency import ModelWrapper
+    from utils import PathValidationError
+
+    fake = tmp_path / "ir.xml"
+    fake.write_text("<net/>")
+    with pytest.raises(PathValidationError, match="openvino:"):
+        ModelWrapper(str(fake), "cpu")
