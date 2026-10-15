@@ -1,19 +1,28 @@
-# YOLOv8s ONNX Runtime Toolchain
+# YOLOv8s Multi-Backend Inference Toolkit — ONNX Runtime · INT8 PTQ · Consistency · Benchmark
 
-A toolchain for taking a **YOLOv8s** PyTorch checkpoint through the
-edge-deployment lifecycle: export → ONNX Runtime inference → static INT8
-quantization (QDQ) → consistency & accuracy validation → latency / throughput /
-memory / mAP benchmark, designed to be reproducible from a single CLI. The CLI
-layer is Python; a C++ inference API is planned alongside the remaining deploy
-milestones.
+[![CI](https://github.com/zhj396/edge-ai-deployment/actions/workflows/ci.yml/badge.svg)](https://github.com/zhj396/edge-ai-deployment/actions/workflows/ci.yml)
+
+A toolchain for taking a **YOLOv8s** PyTorch checkpoint through the full edge-deployment lifecycle:
+**export → ONNX Runtime inference → static INT8 quantization (QDQ / MinMax or Entropy) →
+consistency & accuracy validation → latency / throughput / memory / mAP benchmark**,
+all reproducible from a single CLI.
+
+Built and validated end-to-end on a local PC (13th Gen Intel Core i5-13420H) and a Kaggle
+Tesla T4 ×2 GPU node — sampling strategies and ORT knobs are documented;
+benchmark figures are tracked in [docs/ARCHITECTURE.md
+§11](docs/ARCHITECTURE.md#11-known-results-representative-numbers).
 
 The deploy half lands in milestones; the currently reproducible commands are
 **`export`**, **`inspect`**, **`quantize`**, **`infer`**, **`consistency`**,
-and **`benchmark`**.
-The training half — COCO 12-class subset build, dataset analysis, and baseline
-vs. staged long-tail training that produces `models/yolov8s.pt` — is complete
-and lives in [`train/`](train/), documented in
-**[docs/TRAINING.md](docs/TRAINING.md)**.
+and **`benchmark`**; a C++ inference API follows once the ONNX Runtime path is
+complete.
+
+> A full architecture deep-dive — pipeline, quantization policy, consistency gates, benchmarking —
+> lives in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+>
+> The upstream training half — COCO 12-class subset build, dataset analysis, and baseline vs. staged
+> long-tail training that produces `models/yolov8s.pt` — lives in [`train/`](train/), documented in
+> **[docs/TRAINING.md](docs/TRAINING.md)**.
 
 ---
 
@@ -26,8 +35,9 @@ and lives in [`train/`](train/), documented in
 5. [Quick Start](#quick-start)
 6. [CLI Reference](#cli-reference)
 7. [The Full Pipeline](#the-full-pipeline-end-to-end)
-8. [Tests](#tests)
-9. [Limitations & Future Work](#limitations--future-work)
+8. [Design & Engineering Notes](#design--engineering-notes)
+9. [Tests](#tests)
+10. [Limitations & Future Work](#limitations--future-work)
 
 ---
 
@@ -39,7 +49,7 @@ and lives in [`train/`](train/), documented in
 | **YOLOv8 → ONNX export**    | opset 17, dynamic shape by default, ONNX simplifier; runtime-validated session (structural check, shape inference, ORT probe incl. dynamic-batch check).  |
 | **ONNX model inspection**   | sha256, file size, opset, I/O names and shapes; optional two-model side-by-side comparison.                                                               |
 | **Static INT8 PTQ (QDQ)**   | `quant_pre_process` → `quantize_static`: QUInt8 asymmetric activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL-divergence) calibration. |
-| **Head-aware quantization policy** | The entire Detect head (`/model.22/`) is kept in FP32 via name-prefix exclusion, resolved to concrete node names from the pre-processed graph; op-type `Sigmoid`/`Softmax` exclusion is the fallback layer for builds that rename head nodes. Quantizing the head cls-logit branch collapsed the post-Sigmoid class scores to zero in the validated YOLOv8s configuration. |
+| **Head-aware quantization policy** | The entire Detect head (`/model.22/`) is kept in FP32 via name-prefix exclusion, resolved to concrete node names from the pre-processed graph; op-type `Sigmoid`/`Softmax` exclusion is the fallback layer for builds that rename head nodes. The head stays in FP32 because quantizing its cls-logit branch significantly degrades classification confidence in the validated YOLOv8s configuration. |
 | **Diverse calibration sampler** | `CalibrationSampler`: sqrt-frequency stratified class quotas (floor 1, greedy trim back to budget) → perceptual-hash dedup → ResNet-50 farthest-first traversal over L2-normalized features. |
 | **Two consistency modes** | `tensor` (strict `assert_allclose`) for export regressions; `detection` (per-image IoU / class / score gates) for INT8 regressions, with the raw-tensor stats advisory. Report written atomically after every (imgsz, batch) config; failed-sample images copied out; exit code 1 on FAIL. |
 | **Throughput vs. accuracy** | `benchmark`: p50 / p90 / p95 / p99 latency, FPS, peak RSS (CUDA allocator peak on `--device cuda`), plus optional full-set **per-class mAP50 / mAP50-95** via a backend-agnostic native COCO evaluator (`utils/map_eval.py`) driven over each backend's `infer()`; a `mAP_source` column records per-row provenance (native evaluator / unsupported / failed / no GT / disabled). |
@@ -47,7 +57,7 @@ and lives in [`train/`](train/), documented in
 | **Post-processing**         | `post_process`: NMS via Ultralytics `non_max_suppression`, letterbox→original scale-back via `scale_boxes`, per-image clipping, `[(x1, y1, x2, y2, conf, cls), …]` tuples in original-image coordinates; accepts `np.ndarray` / `torch.Tensor` / list outputs in either `(bs, 4+nc, N)` or `(bs, N, 4+nc)` layout. |
 | **CUDA IO Binding via DLPack** | On CUDA the engine binds the input `torch.Tensor` as an on-device `OrtValue` via DLPack (zero host→device copy) and copies outputs back once per inference; the CPU path is plain numpy `session.run`. Warm-up runs the deployed per-backend/per-device path. |
 | **Path validation**         | `existing_validation` + `PathValidationError` (an `argparse.ArgumentTypeError`, so argparse prints the message verbatim); missing paths under `models/` or `data/` point at [ARTIFACTS.md](ARTIFACTS.md). |
-| **Lazy domain imports**      | `src` resolves domain attributes via PEP 562 `__getattr__`; a bare `import src` stays dependency-light — submodules load on first attribute access. `export` defers its domain import into `run()`; `quantize`, `infer`, `consistency`, and `benchmark` bind at module level, so `main.py` startup loads torch / torchvision / onnx / onnxruntime / cv2 / imagehash / ultralytics / pandas / psutil. |
+| **Lazy domain imports**      | `src` resolves domain attributes via PEP 562 `__getattr__`; a bare `import src` stays dependency-light — submodules load on first attribute access. `export` defers its domain import into `run()`; `quantize`, `infer`, `consistency`, and `benchmark` bind at module level, so `main.py` startup loads torch / torchvision / onnx / onnxruntime / cv2 / imagehash / ultralytics / pandas / psutil, plus numpy / tqdm / Pillow / PyYAML. |
 | **Operational hygiene**     | Rotating file + console logging, third-party logs raised to WARNING, per-module logger names; `gc.collect()` + `malloc_trim(0)` (Linux/glibc only) between benchmark backends so the RSS delta reflects only the current backend. |
 
 ---
@@ -72,8 +82,8 @@ main.py  —  command registry + logging setup
   and `run()`; configs are typed dataclasses in `cli/schema.py`. Path defaults are centralized in
   `cli/__init__.py`. Required-path commands validate at parse time via argparse `type=`
   callables (`existing_validation`, `onnx_only`); commands with optional path flags
-  (`consistency`) declare `default=None` and resolve the documented default at `run()` time
-  via `resolve_path_arg`.
+  (`quantize`, `infer`, `consistency`, `benchmark`) declare `default=None` and resolve the
+  documented default at `run()` time via `resolve_path_arg`.
 * **`src/`** — domain logic: ONNX export with structural validation (onnx.checker, shape
   inference) and a runtime probe through ONNX Runtime; letterbox preprocessing with a
   thread-pool batcher; post-processing (NMS via Ultralytics + scale-back to original
@@ -87,8 +97,8 @@ main.py  —  command registry + logging setup
   native mAP validation).
 * **`utils/`** — logging (rotating file + console), path validation, image discovery, visualization,
   ONNX metadata + SHA-256, percentiles, CPU-thread configuration.
-* **`tests/`** — unit tests; model-free so they run on any laptop (`test_train_staged_retry.py`
-  additionally imports torch).
+* **`tests/`** — unit tests; model-free so they run on any laptop (`test_postprocess.py`,
+  `test_benchmark_map_plumbing.py`, and `test_train_staged_retry.py` additionally pull torch).
 
 ---
 
@@ -108,6 +118,7 @@ edge-ai-deployment/
 ├── requirements-kaggle.txt    # GPU overlay: keeps preinstalled CUDA torch; onnxruntime-gpu
 │
 ├── docs/
+│   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
 │   └── TRAINING.md            # Training docs: subset build, analysis, staged long-tail
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
@@ -283,6 +294,26 @@ Benchmark
 
 ---
 
+## Design & Engineering Notes
+
+The deliberate design decisions behind the toolkit. Each is
+documented **once** — with code refs, rationale, and measured numbers — in the [architecture
+deep-dive](docs/ARCHITECTURE.md):
+
+| Decision | One-liner | Deep-dive |
+| -------- | --------- | --------- |
+| Per-backend warm-up | Warm-up runs real inference through the *deployed* path (IO Binding + DLPack on CUDA) — the path `infer` serves. | [§4.3](docs/ARCHITECTURE.md#43-cuda-path--io-binding-via-dlpack) |
+| CUDA IO Binding via DLPack | Zero host→device copy on input; the engine additionally defers the device→host output copy. Three entry points (see CLAUDE.md invariant 4). | [§4.3](docs/ARCHITECTURE.md#43-cuda-path--io-binding-via-dlpack) |
+| INT8 QDQ + whole-Detect-head FP32 | QDQ maximizes kernel fusion; the `/model.22/` head stays FP32 by name-prefix, with graph-wide Sigmoid/Softmax output-quantization exclusion as the renamed-head fallback. | [§5.5](docs/ARCHITECTURE.md#55-keep-the-entire-detect-head-in-fp32) |
+| Calibration sampling | sqrt-frequency stratification → phash dedup → ResNet-50 farthest-first: class coverage and feature diversity within the calibration budget. | [§6](docs/ARCHITECTURE.md#6-calibration-sampler-design) |
+| Two consistency modes | `tensor` for export regressions; `detection` (per-image IoU/class/score gates authoritative) for INT8. Raw-output p99 is advisory only. | [§7.1](docs/ARCHITECTURE.md#71-two-models-two-modes) |
+| CPU thread tuning | `cv2=0`, `torch=min(4,ncpu)`, ORT `intra=min(4,ncpu)/inter=2` — the validated thread budget for single-stream inference. | [§9](docs/ARCHITECTURE.md#9-threading-memory-and-logging-hygiene) |
+| Memory hygiene between runs | `gc.collect()` + `malloc_trim(0)` (Linux) + CUDA cache/peak reset so `rss_increase_mb` reflects only the current backend. | [§8.2](docs/ARCHITECTURE.md#82-memory-hygiene-between-backends) |
+| Atomic + recoverable JSON | `tmp + os.replace`, re-dumped after every (imgsz, batch-size) combination — a SIGKILL never leaves a half-written report. | [§7.4](docs/ARCHITECTURE.md#74-atomic-recoverable-report-writing) |
+| Logger hygiene | Rotating file handler + stdout, third-party logs raised to WARNING, idempotent init. | [§9](docs/ARCHITECTURE.md#9-threading-memory-and-logging-hygiene) |
+
+---
+
 ## Tests
 
 ```bash
@@ -312,7 +343,7 @@ GitHub Actions runs the same two gates on every push to and pull request against
 
 ## Limitations & Future Work
 
-* **Static INT8 only.** Dynamic quantization and QAT each deserve a separate
+* **Static INT8 only.** Dynamic quantization and QAT each need a separate
   pipeline; the head-exclusion policy (whole `/model.22/` FP32) would need
   re-tuning for QAT-trained models.
 * **Deploy-half milestones land incrementally.** The remaining backends —
