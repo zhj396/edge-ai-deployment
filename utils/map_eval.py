@@ -2,13 +2,15 @@
 
 Pure-NumPy IoU/AP/label-parsing helpers plus a driver :func:`evaluate_map`
 that receives a duck-typed ``engine`` exposing the shared ``infer()`` API
-(``src/engine.py`` — returns ``List[List[(x1,y1,x2,y2,conf,cls)]]`` in
-original-image pixel coords); the module never imports ultralytics itself.
+(``src/engine.py``, ``src/openvino_engine.py`` — both return
+``List[List[(x1,y1,x2,y2,conf,cls)]]`` in original-image pixel coords); the
+module never imports ultralytics itself.
 
 Scope: Ultralytics' ``YOLO(path).val()`` drives only artifacts carrying
 ultralytics metadata (``.pt`` or its own exports); this evaluator accepts any
-engine exposing the shared ``infer()`` API and applies one COCO metric to all
-of them.
+engine exposing the shared ``infer()`` API, raw OpenVINO IRs included, and
+applies one COCO metric to all of them. See docs/ARCHITECTURE.md §8.1 for
+the benchmark-side mAP-provenance note.
 """
 from __future__ import annotations
 
@@ -310,7 +312,7 @@ def evaluate_map(
 
     The engine must expose ``infer(imgs_input, conf, iou, max_imgs, batch_size,
     max_det, save, output_dir) -> List[List[(x1,y1,x2,y2,conf,cls)]]`` (the
-    shared API of YOLOv8Engine). The engine carries its own
+    shared API of YOLOv8Engine / OpenVINOEngine). The engine carries its own
     imgsz — it must be constructed with the size its artifact serves.
     conf=0.001, iou=0.7 are the COCO mAP-standard NMS config (the benchmark's
     ``conf_threshold`` / ``iou_threshold``). Writes the per-class CSV

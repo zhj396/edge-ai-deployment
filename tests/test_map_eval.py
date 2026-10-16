@@ -2,7 +2,8 @@
 
 Model-free: no .pt / .onnx / GPU required. The IoU + AP functions are pure
 NumPy and are exercised with hand-computed synthetic scenarios. The GT-loader
-test is data-guarded (skips if data/images/val is absent).
+test is data-guarded (skips if data/images/val is absent). Model-free per the
+project's test posture (CLAUDE.md: the default suite needs no model or GPU).
 """
 from __future__ import annotations
 
@@ -140,9 +141,12 @@ def test_compute_map_cross_image_matching():
 
 
 # ---------------------------------------------------------------------------
-# This module stays pure-NumPy (no ultralytics on import); note that
-# test_pure_python_tests_dont_pull_ultralytics (tests/test_consistency.py)
-# does not import it, so the purity guard does not cover this module.
+# Import-purity is enforced by the existing
+# test_pure_python_tests_dont_pull_ultralytics (tests/test_consistency.py),
+# which imports this module — so importing utils.map_eval must not pull
+# ultralytics. No separate purge-and-reload test here: purging torch from
+# sys.modules mid-session corrupts torch-type identity for downstream tests
+# (test_postprocess), and is unnecessary given the shared invariant test.
 # ---------------------------------------------------------------------------
 
 
