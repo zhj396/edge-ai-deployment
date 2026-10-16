@@ -35,6 +35,7 @@ _LAZY: dict[str, str] = {
     "quantize_onnx_to_int8": ".quantize",
     "YOLOv8Engine": ".engine",
     "validate_consistency": ".consistency",
+    "Benchmark": ".benchmark",
 }
 
 __all__ = list(_LAZY)
