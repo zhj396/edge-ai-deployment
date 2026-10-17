@@ -12,7 +12,9 @@ in [docs/ARCHITECTURE.md§11](docs/ARCHITECTURE.md#11-known-results-measured-num
 
 The currently reproducible commands are **`export`**, **`inspect`**, **`quantize`**, **`infer`**,
 **`consistency`**, **`benchmark`**, and **`openvino`** (the OpenVINO backend is an optional
-dependency — [docs/OPENVINO.md](docs/OPENVINO.md)).
+dependency — [docs/OPENVINO.md](docs/OPENVINO.md)); a standalone C++ driver on the ONNX Runtime
+C++ API builds beside the Python package and consumes the same exported ONNX
+([docs/ORT_CPP.md](docs/ORT_CPP.md)).
 
 > The training half — COCO 12-class subset build, dataset analysis, and baseline vs.
 > staged long-tail training that produces `models/yolov8s.pt` — is complete and lives
@@ -45,7 +47,7 @@ dependency — [docs/OPENVINO.md](docs/OPENVINO.md)).
 
 | Capability                  | Implementation                                                                                                                                            |
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Multi-backend inference** | `YOLOv8Engine`: one `infer()` API across `pytorch`, `onnx_fp32`, `onnx_int8` × `cpu`/`cuda` — all backends share the same preprocess / post-process pipeline; the `infer` CLI and a `preprocess_imgs`-backed batch loop sit on top. Fixed-shape ONNX inputs are honored: the static batch dim sizes each forward, and a mismatched `imgsz` is rejected at init. `OpenVINOEngine` / `OpenVINOAsyncEngine` mirror the same `infer()` / `infer_frames()` API for OpenVINO IR (FP16/INT8) on CPU / Intel iGPU (see [docs/OPENVINO.md](docs/OPENVINO.md)). |
+| **Multi-backend inference** | `YOLOv8Engine`: one `infer()` API across `pytorch`, `onnx_fp32`, `onnx_int8` × `cpu`/`cuda` — all backends share the same preprocess / post-process pipeline; the `infer` CLI and a `preprocess_imgs`-backed batch loop sit on top. Fixed-shape ONNX inputs are honored: the static batch dim sizes each forward, and a mismatched `imgsz` is rejected at init. `OpenVINOEngine` / `OpenVINOAsyncEngine` mirror the same `infer()` / `infer_frames()` API for OpenVINO IR (FP16/INT8) on CPU / Intel iGPU (see [docs/OPENVINO.md](docs/OPENVINO.md)). A standalone C++ driver (`cpp/`, [docs/ORT_CPP.md](docs/ORT_CPP.md)) consumes the same exported ONNX. |
 | **YOLOv8 → ONNX export**    | opset 17, dynamic shape by default, ONNX simplifier; runtime-validated session (structural check, shape inference, ORT probe incl. dynamic-batch check).  |
 | **ONNX model inspection**   | sha256, file size, opset, I/O names and shapes; optional two-model side-by-side comparison.                                                               |
 | **Static INT8 PTQ (QDQ)**   | `quant_pre_process` → `quantize_static`: QUInt8 asymmetric activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL-divergence) calibration. |
@@ -133,7 +135,13 @@ edge-ai-deployment/
 │   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
 │   ├── DOCKER.md              # Docker images: build, run, server env vars, troubleshooting
 │   ├── OPENVINO.md            # OpenVINO backend: convert, NNCF INT8, devices, benchmarking
+│   ├── ORT_CPP.md             # C++ ONNX Runtime backend (cpp/ tree)
 │   └── TRAINING.md            # Training docs: subset build, analysis, staged long-tail
+│
+├── cpp/                       # Standalone C++ ONNX Runtime backend (see docs/ORT_CPP.md)
+│   ├── common/                # Backend-agnostic core: letterbox, NMS decode, class names (no ORT dep)
+│   ├── onnxruntime/           # ort_cpp exe: pre/post wrappers, session, worker pool, benchmark
+│   └── third_party/           # Committed ORT SDK tarball + extract helper
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
 │
@@ -433,3 +441,7 @@ GitHub Actions runs the same two gates on every push to and pull request against
   the timed loop (RSS can shrink, so it is a lower bound on peak RSS); anonymous vs file-backed
   pages are not differentiated. On Linux `malloc_trim(0)` is called between backend runs; on
   Windows it is a no-op.
+* **Deploy-half milestones land incrementally.** Backends enter the CLI with their milestones;
+  the currently reproducible set is PyTorch, ONNX Runtime, and OpenVINO — the intro paragraph
+  lists the commands. The C++ ONNX Runtime driver is a standalone executable
+  (`cpp/`, [docs/ORT_CPP.md](docs/ORT_CPP.md)).
