@@ -104,6 +104,7 @@ edge-ai-deployment/
 ├── .gitignore                 # models/, data/, coco12-val.zip, results/, runs/, logs/ stay out of git
 ├── requirements.txt           # Core runtime deps (shared CPU/GPU; no torch/ORT) + dev tools
 ├── requirements-cpu.txt       # CPU overlay: +cpu torch/torchvision wheels, onnxruntime
+├── requirements-kaggle.txt    # GPU overlay: keeps preinstalled CUDA torch; onnxruntime-gpu
 │
 ├── docs/
 │   └── TRAINING.md            # Training docs: subset build, analysis, staged long-tail
@@ -175,7 +176,8 @@ pip install -r requirements-cpu.txt
 ```
 
 > **CUDA users:** install the `onnxruntime-gpu` package matching your CUDA toolkit and the matching
-> PyTorch wheel. ONNX Runtime, PyTorch, and CUDA versions must agree.
+> PyTorch wheel. ONNX Runtime, PyTorch, and CUDA versions must agree. On images that preinstall a
+> CUDA torch build (e.g. Kaggle T4), `requirements-kaggle.txt` encodes those version agreements.
 
 The `models/` directory must contain:
 

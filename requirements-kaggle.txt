@@ -1,0 +1,47 @@
+# Kaggle T4 / GPU-notebook dependency set — for environments that already ship a
+# CUDA-enabled torch build (Kaggle's image carries torch 2.x+cu128):
+#   pip install -r requirements-kaggle.txt
+#
+# Differences from the local pin set (requirements.txt / requirements-cpu.txt),
+# so this overlay composes with the preinstalled base image:
+# * torch and torchvision are NOT installed here — the preinstalled CUDA build
+#   already drives the GPU.
+# * numpy is not pinned — the base image's numpy 2.x satisfies every package below
+#   (ultralytics 8.4.114, onnx 1.18.0, opencv 4.10, pandas 2.3.3,
+#   ml_dtypes 0.5.4).
+# * tqdm / pillow / pyyaml are NOT pinned — they are ultralytics' transitive deps and
+#   the base image already carries compatible versions; leaving them unpinned lets
+#   pip keep the preinstalled ones.
+#
+# onnxruntime-gpu==1.26.0 is the last CUDA-12 build (1.27.0+ ships CUDA-13
+# nvidia-cuda-* wheels, which clash with a CUDA-12.x runtime in one process);
+# 1.21.0+ is the minimum that exposes the calibration_providers kwarg used in
+# src/quantize.py (1.20.2 does not have it).
+#
+# Python version: Kaggle's image runs Python 3.13. The pins below mirror the
+# local pin set — onnx 1.18.0 and pandas 2.3.3 ship cp313 wheels, opencv and
+# psutil are abi3 — except imagehash, which stays at the base image's 4.3.2.
+# On a Python <= 3.12 image they also resolve as wheels.
+
+# --- Project runtime deps (functional mirror of requirements.txt, minus the
+# --- pins called out above) ---
+ultralytics==8.4.114
+onnx==1.18.0
+opencv-python==4.10.0.84
+# numpy: not pinned here — keeps the base image's numpy 2.x.
+pandas==2.3.3
+psutil==5.9.8
+# imagehash: direct dependency of src/sampler.py::phash (not transitive).
+# 4.3.2 = base-image version.
+imagehash==4.3.2
+ml_dtypes==0.5.4
+
+# --- Dev / test (drop these lines if you only need infer/benchmark) ---
+black==24.10.0
+isort==5.13.2
+flake8==7.1.0
+pytest==8.3.2
+pytest-cov==5.0.0
+
+# --- ONNX Runtime GPU ---
+onnxruntime-gpu==1.26.0
