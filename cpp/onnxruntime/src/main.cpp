@@ -4,8 +4,10 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -39,8 +41,7 @@ namespace fs = std::filesystem;
 namespace {
 
 // Hardcoded fallback used only when the yaml file cannot be loaded
-// (missing file, parse error). Mirrors data/data.yaml so the demo
-// still runs out of the box without --yaml pointing to anything.
+// (missing file, parse error).
 const std::vector<std::string> kFallbackClassNames = {
     "person", "bicycle", "car", "bus", "truck", "motorcycle",
     "dog",    "cat",     "chair", "bottle", "backpack", "traffic light"
@@ -205,11 +206,7 @@ bool run_benchmark(
         paths = { fs::path(image_path).filename().string() };
     }
 
-    // Warmup count matches the Python benchmark CLI default
-    // (cli/benchmark.py: --warmup 10). The timed count here is the
-    // explicit --benchmark N (a mode switch, 0 = disabled), not a
-    // Python-`--runs`-style default.
-    const int warmup = 10;
+    const int warmup = std::max(0, args.warmup);
     const int iters  = std::max(1, args.benchmark);
 
     std::vector<BenchmarkRow> rows;
@@ -414,13 +411,11 @@ bool run_directory(
     LOG_INFO("  output dir  : " + out_dir.string());
     LOG_INFO("  workers     : " + std::to_string(n_workers));
 
-    // Each worker needs its OWN YOLOv8 instance because a YOLOv8 is not
-    // reentrant: the Preprocessor owns a pre-allocated NCHW buffer /
-    // letterbox canvas / Ort::Value per detect(), and detect() mutates
-    // profile_result_. The pool pins one detector per worker THREAD
-    // (worker_id == thread index 0..N-1 == worker_detectors index) and runs
-    // one task per thread at a time, so each detector is touched by exactly
-    // one thread. Cost: N copies of the ORT session in RSS.
+    // Each worker needs its OWN YOLOv8 instance because the Preprocessor owns
+    // a pre-allocated NCHW buffer that would race if shared. Cost: N copies
+    // of the ORT session in RSS. The pool pins one detector per worker THREAD
+    // (worker_id == thread index 0..N-1 == worker_detectors index) — see
+    // WorkerPool's comment.
     std::vector<std::unique_ptr<YOLOv8>> worker_detectors;
     worker_detectors.reserve(static_cast<size_t>(n_workers));
     for (int i = 0; i < n_workers; ++i) {
@@ -450,9 +445,8 @@ bool run_directory(
     rows.reserve(image_paths.size());
     std::atomic<int> total_detections{0};
 
-    // Enqueue one task per image. The task receives the owning thread's
-    // worker_id (the pool guarantees one task per thread at a time), so each
-    // detector is only ever touched by one thread.
+    // Enqueue one task per image. The task receives the owning thread's worker_id
+    // (NOT i % n_workers) so each detector is only touched by one thread.
     for (size_t i = 0; i < image_paths.size(); ++i) {
         pool.enqueue([
             i, &image_paths, &worker_detectors,
@@ -466,6 +460,8 @@ bool run_directory(
             }
 
             YOLOv8& d = *worker_detectors[worker_id];
+            // steady_clock: monotonic (high_resolution_clock aliases system_clock
+            // on libstdc++ — an NTP step would corrupt timing).
             auto t0 = std::chrono::steady_clock::now();
             auto detections = d.detect(img, args.conf, args.iou);
             auto t1 = std::chrono::steady_clock::now();
@@ -542,6 +538,125 @@ bool run_directory(
     return true;
 }
 
+// Write a raw ORT output tensor to a NumPy .npy file (little-endian float32).
+// Minimal hand-rolled writer — no numpy dep on the C++ side. The Python
+// consistency wrapper np.load()s these back. Format: 6-byte magic
+// "\x93NUMPY" + 2-byte version (1.0) + 2-byte little-endian header length +
+// ASCII dict header (padded to a 64-byte boundary) + raw float32 data.
+// Byte-order note: the header advertises '<f4' but the payload is the host
+// memory copied verbatim — no byte swapping is performed. Valid on any
+// little-endian host (x86-64 / the validated environment); big-endian hosts
+// would need an explicit conversion before the write.
+bool write_npy(const std::string& path, const Ort::Value& tensor) {
+    auto info = tensor.GetTensorTypeAndShapeInfo();
+    const auto shape = info.GetShape();  // std::vector<int64_t>
+    const float* data = tensor.GetTensorData<float>();
+
+    size_t count = 1;
+    std::string shape_str = "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) shape_str += ", ";
+        shape_str += std::to_string(shape[i]);
+        if (shape[i] > 0) count *= static_cast<size_t>(shape[i]);
+    }
+    if (shape.size() == 1) shape_str += ",";  // "(N,)" for 1-D
+    shape_str += ")";
+
+    std::string dict =
+        "{'descr': '<f4', 'fortran_order': False, 'shape': " + shape_str + ", }";
+    // Pad so (10 + dict.size() + pad + 1('\n')) % 64 == 0.
+    size_t total = 10 + dict.size() + 1;
+    size_t pad = (64 - (total % 64)) % 64;
+    std::string header = dict + std::string(pad, ' ') + "\n";
+    uint16_t header_len = static_cast<uint16_t>(header.size());
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out.is_open()) {
+        LOG_ERROR("Failed to open .npy for writing: " + path);
+        return false;
+    }
+    out.write("\x93NUMPY", 6);
+    out.write("\x01\x00", 2);  // version 1.0
+    out.write(reinterpret_cast<const char*>(&header_len), 2);
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    out.write(reinterpret_cast<const char*>(data),
+             static_cast<std::streamsize>(count * sizeof(float)));
+    return static_cast<bool>(out);
+}
+
+// --dump-raw-dir mode: load the model ONCE, iterate the (sorted) images in
+// args.dir, run forwardRaw per image, write each raw output to
+// <dump_raw_dir>/<basename>.npy. The Python consistency wrapper stages a temp
+// in-dir with zero-padded names so the sorted order matches its batch order,
+// then loads the .npy files back in sorted order. One process per invocation →
+// the ORT session is loaded once per call (not per image).
+bool run_dump_raw_dir(
+    YOLOv8& detector,
+    const CLIArgs& args
+) {
+    fs::path dir(args.dir);
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+        LOG_ERROR("Directory not found: " + args.dir);
+        return false;
+    }
+    std::vector<fs::path> image_paths;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file(ec) && is_image_extension(entry.path())) {
+            image_paths.push_back(entry.path());
+        }
+    }
+    std::sort(image_paths.begin(), image_paths.end());
+    if (image_paths.empty()) {
+        LOG_ERROR("No images (.jpg/.jpeg/.png/.bmp) found in: " + args.dir);
+        return false;
+    }
+
+    fs::path out_dir(args.dump_raw_dir);
+    fs::create_directories(out_dir, ec);
+    if (ec) {
+        LOG_ERROR("Failed to create output directory " + out_dir.string()
+                  + ": " + ec.message());
+        return false;
+    }
+
+    // Warm the session before dumping outputs.
+    {
+        cv::Mat warm = cv::imread(image_paths.front().string());
+        if (!warm.empty()) {
+            PreprocessResult pre;
+            detector.forwardRaw(warm, pre);
+        }
+    }
+
+    LOG_INFO("=== Dump raw forward ===");
+    LOG_INFO("  in dir   : " + args.dir);
+    LOG_INFO("  out dir  : " + args.dump_raw_dir);
+    LOG_INFO("  images   : " + std::to_string(image_paths.size()));
+
+    for (size_t i = 0; i < image_paths.size(); ++i) {
+        cv::Mat img = cv::imread(image_paths[i].string());
+        if (img.empty()) {
+            LOG_WARN("  skip (unreadable) : " + image_paths[i].filename().string());
+            continue;
+        }
+        PreprocessResult pre;
+        auto out = detector.forwardRaw(img, pre);
+        // <out_dir>/<stem>.npy — zero-padded stems keep sorted order == batch order.
+        fs::path npy = out_dir / (image_paths[i].stem().string() + ".npy");
+        if (!write_npy(npy.string(), out)) {
+            LOG_ERROR("  failed   : " + npy.string());
+            return false;
+        }
+        LOG_INFO("  [" + std::to_string(i + 1) + "/"
+                 + std::to_string(image_paths.size()) + "] "
+                 + image_paths[i].filename().string() + " -> "
+                 + npy.filename().string());
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -597,10 +712,15 @@ int main(int argc, char* argv[]) {
                         args.intra_op_threads, args.inter_op_threads);
 
         bool ok = true;
-        // --benchmark is a modifier checked FIRST: it can combine with --image or
-        // --dir (or fall back to the default sample), so don't let run_single_image
-        // grab it when an image source is also present.
-        if (args.benchmark > 0) {
+        // --dump-raw-dir is checked FIRST: it is a consistency-harness mode that
+        // requires --dir and produces raw forward tensors (no NMS), so it must not
+        // be grabbed by run_directory (which writes annotated images) or run_benchmark.
+        if (!args.dump_raw_dir.empty()) {
+            ok = run_dump_raw_dir(detector, args);
+        } else if (args.benchmark > 0) {
+            // --benchmark is a modifier checked next: it can combine with --image
+            // or --dir (or fall back to the default sample), so don't let
+            // run_single_image grab it when an image source is also present.
             ok = run_benchmark(detector, args);
         } else if (!args.dir.empty()) {
             ok = run_directory(detector, args, class_names);

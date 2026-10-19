@@ -33,6 +33,8 @@ void print_help(const char* prog) {
         "                               source) it is the output directory\n"
         "                               default: results/\n"
         "      --save-json <path>       dump benchmark summary to JSON\n"
+        "      --dump-raw-dir <dir>     dump raw pre-NMS forward tensors (.npy per image)\n"
+        "                               for the Python consistency harness; requires --dir\n"
         "\n"
         "Performance:\n"
         "      --intra-op-threads <int> ORT intra-op threads (default: 0 = ORT default)\n"
@@ -73,9 +75,13 @@ CLIArgs parse_cli(int argc, char** argv) {
             cxxopts::value<int>()->default_value("0"))
         ("inter-op-threads",   "ORT inter-op threads (0 = ORT default)",
             cxxopts::value<int>()->default_value("0"))
+        ("warmup",             "benchmark warmup iterations",
+            cxxopts::value<int>()->default_value("10"))
         ("workers",            "parallel --dir workers (0 = hardware_concurrency)",
             cxxopts::value<int>()->default_value("0"))
         ("save-json",          "benchmark JSON output",
+            cxxopts::value<std::string>())
+        ("dump-raw-dir",       "dump raw pre-NMS forward tensors (.npy per image); requires --dir",
             cxxopts::value<std::string>())
         ("h,help",             "show help");
 
@@ -93,6 +99,7 @@ CLIArgs parse_cli(int argc, char** argv) {
         if (result.count("yaml"))      args.yaml_path  = result["yaml"].as<std::string>();
         if (result.count("output"))    args.output     = result["output"].as<std::string>();
         if (result.count("save-json")) args.save_json  = result["save-json"].as<std::string>();
+        if (result.count("dump-raw-dir")) args.dump_raw_dir = result["dump-raw-dir"].as<std::string>();
 
         args.imgsz            = result["imgsz"].as<int>();
         args.conf             = result["conf"].as<float>();
@@ -101,6 +108,7 @@ CLIArgs parse_cli(int argc, char** argv) {
         args.max_images       = result["max-images"].as<int>();
         args.intra_op_threads = result["intra-op-threads"].as<int>();
         args.inter_op_threads = result["inter-op-threads"].as<int>();
+        args.warmup           = result["warmup"].as<int>();
         args.workers          = result["workers"].as<int>();
 
         // --image and --dir are mutually exclusive image sources. --benchmark is a
@@ -121,6 +129,9 @@ CLIArgs parse_cli(int argc, char** argv) {
             fail("Conflicting image sources: use --image OR --dir, not both.");
         } else if (!bench && !has_img && !has_dir) {
             fail("No input source: provide --image, --dir, or --benchmark N.");
+        }
+        if (!args.dump_raw_dir.empty() && args.dir.empty()) {
+            fail("--dump-raw-dir requires --dir <in_dir>.");
         }
 
         if (args.imgsz <= 0) {

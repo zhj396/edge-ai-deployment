@@ -99,7 +99,9 @@ BenchmarkSummary Benchmark::run(
 
     for (int i = 0; i < timed_iters; ++i) {
         auto [img, label] = pick(i);
-        // steady_clock: monotonic (see yolov8.cpp for the clock-choice note).
+        // steady_clock, not high_resolution_clock: on Linux libstdc++ the
+        // latter aliases system_clock, and an NTP step mid-run yields
+        // negative elapsed rows that corrupt mean/stddev/min.
         auto t0 = std::chrono::steady_clock::now();
         detector.detect(img, conf_threshold, iou_threshold);
         auto t1 = std::chrono::steady_clock::now();

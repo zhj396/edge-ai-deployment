@@ -28,10 +28,14 @@ struct CLIArgs {
     std::string output;     // --output   annotated file (single-image mode) or
                             //             dir (every other mode)
     std::string save_json;  // --save-json
+    std::string dump_raw_dir;  // --dump-raw-dir  write raw pre-NMS forward tensors
+                               // (.npy per image) for the Python consistency
+                               // harness. Requires --dir; ignores conf/iou/NMS.
 
     // Performance
     int intra_op_threads = 0;  // --intra-op-threads   0 = ORT default (all cores)
     int inter_op_threads = 0;  // --inter-op-threads   0 = ORT default
+    int warmup          = 10;  // --warmup              benchmark warmup iterations
     int workers         = 0;  // --workers             # of parallel --dir workers
                               //                       <= 0 = hardware_concurrency()
 

@@ -12,17 +12,20 @@ void YOLOv8::initializeSession(const std::string& model_path,
     session_options_.SetGraphOptimizationLevel(
         GraphOptimizationLevel::ORT_ENABLE_ALL
     );
-    session_options_.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+
+    // SEQUENTIAL default; inter_op > 1 opts into ORT_PARALLEL.
+    if (inter_op_threads > 1) {
+        session_options_.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
+        session_options_.SetInterOpNumThreads(inter_op_threads);
+    } else {
+        session_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    }
 
     // Thread counts: 0 leaves the ORT default (intra-op = all cores); a
     // positive value pins the pool (--intra-op-threads / --inter-op-threads
-    // on the CLI). With ORT_PARALLEL, inter_op must be set explicitly or
-    // ORT keeps its per-branch default pool.
+    // on the CLI).
     if (intra_op_threads > 0) {
         session_options_.SetIntraOpNumThreads(intra_op_threads);
-    }
-    if (inter_op_threads > 0) {
-        session_options_.SetInterOpNumThreads(inter_op_threads);
     }
 
     session_ = Ort::Session(env_, model_path.c_str(), session_options_);
@@ -77,7 +80,7 @@ std::vector<Detection> YOLOv8::detect(
     float conf_threshold,
     float iou_threshold
 ) {
-    using clock = std::chrono::steady_clock;  // monotonic; high_resolution_clock aliases system_clock on libstdc++ (an NTP step mid-run would corrupt timing)
+    using clock = std::chrono::steady_clock;  // monotonic; high_resolution_clock aliases system_clock on libstdc++
     auto t_total_start = clock::now();
 
     // 1) Preprocess — letterbox + HWC->CHW into the pre-allocated tensor.
@@ -119,4 +122,23 @@ std::vector<Detection> YOLOv8::detect(
 
 const ProfileResult& YOLOv8::profile() const {
     return profile_result_;
+}
+
+Ort::Value YOLOv8::forwardRaw(const cv::Mat& image, PreprocessResult& pre) {
+    // Mirror detect()'s first two stages (preprocess + Run) but skip decode/NMS,
+    // returning the raw output tensor for the consistency harness to compare
+    // against the Python ORT forward. The Ort::Value is moved out and owns its
+    // own buffer (session_.Run allocates a fresh output tensor per call), so it
+    // stays valid until the caller destroys it.
+    Ort::Value& input_tensor = preprocessor_.process(image, pre);
+
+    auto output_tensors = session_.Run(
+        run_options_,
+        input_names_ptr_.data(),
+        &input_tensor,
+        1,
+        output_names_ptr_.data(),
+        output_names_ptr_.size()
+    );
+    return std::move(output_tensors[0]);
 }
