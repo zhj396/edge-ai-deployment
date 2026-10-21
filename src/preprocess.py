@@ -213,6 +213,11 @@ def preprocess_imgs(
 # ---------------------------------------------------------------------------
 # Batch assembly (shared by the file- and frame-backed paths)
 # ---------------------------------------------------------------------------
+# Device strings already warned about in _assemble_batch (one warning per
+# process per string, not per batch).
+_UNUSED_DEVICE_WARNED = set()
+
+
 def _assemble_batch(
     results: List[dict],
     device: str = "cpu",
@@ -230,9 +235,14 @@ def _assemble_batch(
         # pin_memory only meaningful for host tensors being copied to CUDA
         tensor = tensor.pin_memory().to(device, non_blocking=True)
     else:
-        if device != "cpu":
+        if device != "cpu" and device not in _UNUSED_DEVICE_WARNED:
+            # Warn once per process per device string: a numeric id (the
+            # consistency CLI's TensorRT GPU selection) recurs on every
+            # batch of the same run, and the message is a property of the
+            # run's configuration, not of the batch.
+            _UNUSED_DEVICE_WARNED.add(device)
             logger.warning(
-                "Device '%s' unavailable or unsupported for preprocessing; using 'cpu'",
+                "Device '%s' not used for preprocessing; preprocessing stays on 'cpu'",
                 device,
             )
         actual_device = "cpu"

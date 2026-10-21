@@ -119,6 +119,13 @@ def test_existing_validation_accepts_dir(tmp_path):
     assert existing_validation(d) == d
 
 
+def test_existing_validation_accepts_trt_engine(tmp_path):
+    '".engine" is an accepted model suffix.'
+    f = tmp_path / "yolov8s_fp16.engine"
+    f.write_bytes(b"")
+    assert existing_validation(f) == f
+
+
 def test_existing_validation_rejects_unknown_suffix(tmp_path):
     f = tmp_path / "x.xyz"
     f.write_text("hello")
@@ -287,3 +294,21 @@ def test_clamp_workers_uses_real_ncpu_when_unspecified():
 
     out = clamp_workers(2)  # ncpu=None
     assert out >= 1
+
+
+def test_select_providers_parses_cuda_id_string():
+    """``"cuda:<id>"`` resolves to the same CUDA EP config as an int id (the
+    mapping stays in this single source of truth)."""
+    from utils.model_utils import select_providers
+
+    via_int = select_providers(2)
+    via_str = select_providers("cuda:2")
+    if "CUDAExecutionProvider" not in __import__("onnxruntime").get_available_providers():
+        # CPU-only box: both fall back to CPU and must agree.
+        assert via_int == via_str == ["CPUExecutionProvider"]
+        return
+    assert via_str[0][1]["device_id"] == 2
+    assert via_str == via_int
+    assert select_providers("cuda")[0][1]["device_id"] == 0
+    # Non-CUDA requests stay CPU.
+    assert select_providers("cpu") == ["CPUExecutionProvider"]
