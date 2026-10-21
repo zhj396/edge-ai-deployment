@@ -1,0 +1,16 @@
+# Web layer only for the FastAPI inference server.
+#
+# The inference stack itself (torch / onnx / onnxruntime / ultralytics / opencv
+# / numpy / pandas / psutil / pyyaml / pillow ...) comes from requirements-cpu.txt,
+# which the Dockerfile installs alongside this file. The server's import graph
+# requires ultralytics (engine.py imports ultralytics.YOLO at module level, and
+# src/postprocess.py imports ultralytics.utils.nms for NMS), so the server installs
+# the tested CPU stack verbatim plus this web layer. See docker/Dockerfile.server.
+#
+# Only the web deps live here. Pinned for reproducible builds.
+# python-multipart 0.0.20: CVE-2024-53981 (malformed multipart form data
+# triggers excessive recursion / DoS) is fixed as of 0.0.18.
+fastapi==0.110.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.20
+pydantic==2.6.0

@@ -287,6 +287,59 @@ guarded by
 (two subprocesses with different hash seeds must produce the same
 selection).
 
+### 14. Docker images reuse the tested requirement files, not hand-pinned sets
+
+Both images (`docker/Dockerfile.toolchain`, `docker/Dockerfile.server`)
+install `-r requirements-cpu.txt` verbatim. That overlay pins
+`torch==2.6.0+cpu`, `torchvision==0.21.0+cpu`, and `onnxruntime==1.26.0`,
+and includes the shared pins of `requirements.txt` (among them
+`numpy==2.2.6`), so the images resolve to the exact tested CPU pin set.
+The server adds the thin web layer through
+`docker/requirements-server.txt` — the only pins beyond the tested CPU
+stack are `fastapi`, `uvicorn[standard]`, `python-multipart`, and
+`pydantic` (the `[standard]` extra pulls uvicorn's usual companion
+packages transitively).
+
+The server carries the full CPU stack. `ultralytics` is an
+unconditional dependency of the engine import path: `src/engine.py`
+imports `YOLO` at module level, and `src/postprocess.py` imports
+`non_max_suppression` from `ultralytics.utils.nms` at module level, so
+`from src import YOLOv8Engine` fails without `ultralytics` regardless of
+how NMS is implemented. `requirements.txt` alone omits
+`torch` / `onnxruntime` (see Dependency Boundaries). Because
+`ultralytics` is unavoidable on the engine path, the server uses the
+Ultralytics NMS implementation for post-processing — the rationale is
+recorded in the `docker/Dockerfile.server` header.
+
+Any new image must install the project's tested requirement files for
+its target runtime verbatim, never a hand-derived pin subset. A
+CUDA/DLPack server path must additionally respect the DLPack
+synchronization semantics of invariant 4. The multi-stage server
+build strips only the compiler (`gcc` / `build-essential`) from the
+runtime stage; the full CPU stack remains.
+
+### 15. The server inference hot path is in-memory
+
+`docker/server.py::_infer_single` calls
+`YOLOv8Engine.infer_frames([frame], ...)`, which preprocesses the
+already-decoded BGR frame through `preprocess_frames` and reuses
+`_run_batch` — the same forward and post-process body as the CLI `infer`
+command, so the deployed path and the server path run the same code.
+
+The hot path operates on the already-decoded in-memory frame end to
+end: array decode → `preprocess_frames` → `_run_batch`. A request
+never round-trips its upload through disk. (Framework-level upload
+buffering that may precede decode — e.g. Starlette spooling large
+multipart bodies to a temp file — is outside this invariant.)
+
+`preprocess_imgs` (file-backed) and `preprocess_frames` (array-backed)
+share `_preprocess_bgr` + `_assemble_batch` in `src/preprocess.py`:
+letterbox lives inside `_preprocess_bgr` and tensor assembly inside
+`_assemble_batch`, so a change to either is made once in the shared
+core and applies to both entry points — it must not be duplicated per
+path.
+`preprocess_frames` is registered in `src/__init__.py::_LAZY`.
+
 ## Testing and Quality Gates
 
 The default test suite is designed to run without a model,

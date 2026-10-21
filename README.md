@@ -23,6 +23,9 @@ complete.
 > The upstream training half — COCO 12-class subset build, dataset analysis, and baseline vs. staged
 > long-tail training that produces `models/yolov8s.pt` — lives in [`train/`](train/), documented in
 > **[docs/TRAINING.md](docs/TRAINING.md)**.
+>
+> Docker packaging — a full-CLI toolchain image and a FastAPI inference-server image — is documented
+> in **[docs/DOCKER.md](docs/DOCKER.md)**.
 
 ---
 
@@ -101,6 +104,9 @@ main.py  —  command registry + logging setup
   `test_preprocess.py`, `test_benchmark_map_plumbing.py`,
   `test_consistency_ort_forward.py`, and `test_train_staged_retry.py`
   additionally pull torch — the last one at fixture time).
+* **`docker/`** — FastAPI inference server (`docker/server.py`) plus the toolchain / server
+  Dockerfiles; both images install the pinned `requirements-cpu.txt` stack verbatim
+  (see [docs/DOCKER.md](docs/DOCKER.md)).
 
 ---
 
@@ -115,12 +121,15 @@ edge-ai-deployment/
 ├── .flake8                    # flake8 config (flake8 7.x does not read pyproject.toml)
 ├── .gitignore                 # models/, data/, coco12-val.zip, results/, runs/, logs/ stay out of git
 ├── .github/workflows/ci.yml   # GitHub Actions: flake8 + pytest on push / PR (Python 3.12 / 3.13)
+├── .dockerignore              # Keeps the Docker build context free of models/ data/ .claude/ …
+├── docker-compose.yml         # Local dev convenience: `server` + `toolchain` services
 ├── requirements.txt           # Core runtime deps (shared CPU/GPU; no torch/ORT) + dev tools
 ├── requirements-cpu.txt       # CPU overlay: +cpu torch/torchvision wheels, onnxruntime
 ├── requirements-kaggle.txt    # GPU overlay: keeps preinstalled CUDA torch; onnxruntime-gpu
 │
 ├── docs/
 │   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
+│   ├── DOCKER.md              # Docker images: build, run, server env vars, troubleshooting
 │   └── TRAINING.md            # Training docs: subset build, analysis, staged long-tail
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
@@ -158,6 +167,12 @@ edge-ai-deployment/
 │   ├── visualization.py       # draw_detections / save_annotated_image
 │   └── map_eval.py            # Backend-agnostic native COCO mAP evaluator
 │
+├── docker/                    # Docker packaging
+│   ├── server.py              # FastAPI inference server (in-memory hot path via infer_frames)
+│   ├── requirements-server.txt # Web layer only: fastapi / uvicorn / python-multipart / pydantic
+│   ├── Dockerfile.toolchain   # Full CLI image (requirements-cpu.txt verbatim)
+│   └── Dockerfile.server      # Multi-stage server image: non-root app, tini, compiler stripped
+│
 └── tests/                     # Unit tests (no model / GPU required)
     ├── conftest.py            # Adds project root to sys.path; data_dir fixture skips without data/
     ├── test_utils.py          # utils + CLI path-validation regressions
@@ -193,6 +208,10 @@ pip install -r requirements-cpu.txt
 > **CUDA users:** install the `onnxruntime-gpu` package matching your CUDA toolkit and the matching
 > PyTorch wheel. ONNX Runtime, PyTorch, and CUDA versions must agree. On images that preinstall a
 > CUDA torch build (e.g. Kaggle T4), `requirements-kaggle.txt` encodes those version agreements.
+
+> **Docker:** both a full-CLI toolchain image and a FastAPI inference-server image install the
+> pinned `requirements-cpu.txt` stack verbatim — build and run instructions live in
+> [docs/DOCKER.md](docs/DOCKER.md).
 
 The `models/` directory must contain:
 
