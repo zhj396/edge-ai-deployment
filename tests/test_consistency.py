@@ -273,3 +273,76 @@ def test_consistency_plain_openvino_suffix_rejected(tmp_path):
     fake.write_text("<net/>")
     with pytest.raises(PathValidationError, match="openvino:"):
         ModelWrapper(str(fake), "cpu")
+
+
+# ---------------------------------------------------------------------------
+# conf-cliff gate and dual verdict (utils/comparison.py, tensor mode)
+
+
+def _yolo_layout(bs: int, nc: int, n: int, cls_scores) -> np.ndarray:
+    """Build a (bs, 4+nc, N) tensor: box coords ~0..640, class scores given."""
+    out = np.zeros((bs, 4 + nc, n), dtype=np.float32)
+    out[:, :4, :] = np.linspace(0, 640, n, dtype=np.float32)
+    out[:, 4:, :] = np.asarray(cls_scores, dtype=np.float32).reshape(bs, nc, n)
+    return out
+
+
+def test_compare_tensors_cliff_gate_clean_when_detections_stable():
+    """A small class-score divergence that flips no boxes across the cliff
+    leaves the cliff gate clean."""
+    # 8 boxes with score just above conf=0.25 on both sides (no flips).
+    scores = np.full((1, 2, 8), 0.30)
+    out1 = _yolo_layout(1, 2, 8, scores)
+    out2 = out1.copy()
+    out2[:, 4:, :] += 1e-4  # FP32-noise-level; 0.30±1e-4 stays above 0.25
+    stats = compare_tensors(out1, out2, mode="tensor", nc=2,
+                            conf_cliff=0.25, atol=1e-3, rtol=1e-3)
+    assert stats["allclose_passed"] is True
+    assert stats["detection_consistent"] is True
+    assert stats["passed"] is True
+    assert stats["above_cliff_1"] == stats["above_cliff_2"] == 8
+
+
+def test_compare_tensors_cliff_gate_fails_on_spurious_flip():
+    """A divergence within allclose tolerance that flips many boxes across the
+    cliff FAILS tensor mode even though allclose passes."""
+    scores = np.full((1, 2, 8), 0.249)  # just below the cliff on side 1
+    out1 = _yolo_layout(1, 2, 8, scores)
+    out2 = out1.copy()
+    out2[:, 4:, :] += 0.003  # 0.252 — above the cliff; within atol=1e-2
+    stats = compare_tensors(out1, out2, mode="tensor", nc=2,
+                            conf_cliff=0.25, atol=1e-2, rtol=1e-2,
+                            cliff_count_thresh=1.0)
+    assert stats["allclose_passed"] is True
+    assert stats["detection_consistent"] is False
+    assert stats["passed"] is False
+    assert "conf-cliff" in stats["error_msg"]
+
+
+def test_compare_tensors_dual_verdict_reduced_precision_pair():
+    """FP16-style divergence: allclose cannot pass at a tolerance that still
+    catches the regression, yet the cliff gate stays clean — both verdicts
+    carried separately."""
+    out1 = _yolo_layout(1, 2, 8, np.full((1, 2, 8), 0.30))
+    out2 = out1.copy()
+    out2[:, :4, :] += 2.0   # box coords diverge by px-scale (FP16 head noise)
+    out2[:, 4:, :] += 1e-3  # class scores still above the 0.25 cliff
+    stats = compare_tensors(out1, out2, mode="tensor", nc=2,
+                            conf_cliff=0.25, atol=1e-3, rtol=1e-3)
+    assert stats["allclose_passed"] is False
+    assert stats["detection_consistent"] is True
+    assert stats["passed"] is False
+
+
+def test_compare_tensors_cliff_gate_skipped_without_inferable_nc():
+    """A non-3D layout (no inferable nc, no explicit nc) skips the cliff
+    gate entirely — no above_cliff stats, no detection_consistent field."""
+    # Deterministic input (repo rule: unit tests stay deterministic)
+    # spanning a wide magnitude range (0-700).
+    a = np.linspace(0.0, 700.0, 320, dtype=np.float32).reshape(8, 40)
+    b = a + 1e-4
+    stats = compare_tensors(a, b, mode="tensor", conf_cliff=0.25,
+                            atol=1e-3, rtol=1e-3)
+    assert "above_cliff_1" not in stats
+    assert "detection_consistent" not in stats
+    assert stats["passed"] is True

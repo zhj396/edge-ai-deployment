@@ -117,3 +117,70 @@ class OpenVINORunConfig:
     output_dir: Path
     # Optional: data.yaml for class names (IR has no ultralytics names meta).
     data_yaml: Optional[Path] = None
+
+
+@dataclass
+class TensorRTBuildConfig:
+    model: Path
+    # The ONNX, or a .pt auto-exported to a TRT-friendly ONNX first (still
+    # Path A).
+    output: Path           # the .engine output
+    imgsz: int
+    precision: str        # fp32 | fp16 | int8
+    max_batch: int
+    workspace_bytes: int
+    device: int
+    static: bool = False  # static-batch=1 engine (Turing/sm_75 route)
+    # INT8-only, calibrator path: pin the /model.22/ Detect head to FP32 via
+    # layer.precision + OBEY_PRECISION_CONSTRAINTS. The default-INT8 build
+    # uses the QDQ path, where the head stays FP32 by QDQ-omission
+    # (no calibrator/OBEY). This flag only matters under --calibrator.
+    # --no-exclude-head quantizes the whole net.
+    exclude_head: bool = True
+    # INT8-only: opt into the calibrator+OBEY INT8 path (plain ONNX +
+    # IInt8EntropyCalibrator2). Default False = the QDQ path
+    # (quantize_onnx_to_int8 head-excluded QDQ on the TRT-friendly ONNX; no
+    # calibrator; head FP32 by QDQ omission).
+    calibrator: bool = False
+    # INT8-only (Path A): calibration image list dir + cache.
+    calib_imgs_input: Optional[Path] = None
+    calib_cache: Optional[Path] = None
+    max_cal_samples: int = 300
+    resnet50: Optional[Path] = None
+    # INT8 QDQ-path only: calibration method for the quantize_onnx_to_int8 step.
+    # Entropy (KL-divergence) may fit tight activation distributions better
+    # under the forced SYMMETRIC quantization TRT requires
+    # (ActivationSymmetric=True) (see docs/TENSORRT.md). No-op for the
+    # --calibrator path (TRT's own IInt8EntropyCalibrator2 runs then).
+    calib_method: str = "MinMax"
+
+
+@dataclass
+class TensorRTExportConfig:
+    """Path B: .pt -> .engine via Ultralytics native export."""
+    model: Path            # the .pt
+    output: Path
+    imgsz: int
+    precision: str         # fp32 | fp16 | int8
+    device: int
+    data_yaml: Optional[Path] = None  # required for INT8
+
+
+@dataclass
+class TensorRTRunConfig:
+    model: Path            # the .engine
+    imgs_input: Path
+    imgsz: int
+    device: int
+    max_imgs: int
+    batch_size: int
+    conf: float
+    iou: float
+    output_dir: Path
+    # Optional: data.yaml for class names (a serialized .engine has no
+    # ultralytics names metadata).
+    data_yaml: Optional[Path] = None
+    # Max batch of the profile the engine was built with; forwards are capped
+    # at it (sub-looped). The serialized engine's own profile max caps this
+    # further, and a static engine steps at 1.
+    max_batch: int = 8
