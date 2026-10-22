@@ -7,7 +7,7 @@ Workflow
    primary). For an existing ONNX, the ``*_trt`` export (opset 13,
    no-simplify) is the validated input config; the canonical
    ``yolov8s_fp32.onnx`` (opset 17 + simplify) carries the dynamic
-   Shape+Slice subgraph named in the ``--model`` help.
+   Shape+Slice subgraph named in the ``--model`` help — see docs/TENSORRT.md.
 2. ``python main.py tensorrt export --model models/yolov8s.pt --precision fp16``
    .pt -> .engine via Ultralytics native export (Path B, Kaggle/Colab).
 3. ``python main.py tensorrt run   --model models/yolov8s_fp16.engine --imgs-input data/images/val``
@@ -79,7 +79,8 @@ def add_parser(subparsers):
                               "TRT-friendly ONNX: opset 13, no-simplify, "
                               "dynamic unless --static — the canonical "
                               "opset-17+simplify ONNX carries the subgraph "
-                              "behind the Turing build-failure signature)")
+                              "behind the Turing build-failure signature, "
+                              "see docs/TENSORRT.md)")
     p_build.add_argument("--output", type=Path, default=None,
                          help="Output .engine path (default: "
                               "models/yolov8s_int8.engine for --precision int8, "
@@ -109,7 +110,7 @@ def add_parser(subparsers):
         default="MinMax",
         help="INT8 QDQ calibration method (MinMax default). Entropy (KL) may "
              "fit tight activation distributions better under the forced "
-             "symmetric quantization TRT requires. "
+             "symmetric quantization TRT requires (see docs/TENSORRT.md). "
              "QDQ-path only (no-op under --calibrator). NOTE: Entropy holds "
              "all intermediate tensors in host memory during calibration "
              "(ORT's HistogramCalibrater); reduce --max-cal-samples "
@@ -128,8 +129,8 @@ def add_parser(subparsers):
              "dynamic-batch DFL reshape forces a Shape+Slice subgraph that "
              "TRT 10.x fails to lower on Turing (tactic-selection "
              "signature: 'nbDims > Dims::MAX_DIMS'; cause inferred from "
-             "the failure log, not documented by NVIDIA). "
-             "On Ampere+ (sm_80+) the dynamic route "
+             "the failure log, not documented by NVIDIA — see "
+             "docs/TENSORRT.md). On Ampere+ (sm_80+) the dynamic route "
              "(--static off, 1..max_batch) is the expected default.",
     )
     p_build.add_argument(
@@ -274,7 +275,7 @@ def _run_build(args):
     # first: the canonical opset-17 + onnxsim-simplify ONNX carries a dynamic
     # Shape+Slice subgraph behind the tactic-selection failure on Turing T4
     # (observed "nbDims > Dims::MAX_DIMS"; cause inferred from the log, not
-    # documented by NVIDIA). The TRT-friendly export
+    # documented by NVIDIA — see docs/TENSORRT.md). The TRT-friendly export
     # (opset 13, no simplify, dynamic unless --static) is the config
     # validated on the T4.
     # A .onnx is used as-is — pass a TRT-friendly one (or just
@@ -343,7 +344,7 @@ def _run_build(args):
             # Calibrator ablation: build the image list for TRT's calibrator.
             # Under calibrator-based implicit INT8 the precision constraints
             # may not bind at tactic selection, so the head may still run
-            # INT8.
+            # INT8 — see docs/TENSORRT.md.
             from src import CalibrationSampler
             sampler = CalibrationSampler(
                 data_yaml=data_yaml,

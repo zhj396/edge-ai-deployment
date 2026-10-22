@@ -43,7 +43,7 @@ def add_parser(subparsers):
             "--model tensorrt_fp16:models/yolov8s_fp16.engine "
             "--model tensorrt_int8:models/yolov8s_int8.engine "
             "(requires the .engine built via `python main.py tensorrt build`; "
-            "GPU id via the TENSORRT_DEVICE env var) "
+            "see docs/TENSORRT.md; GPU id via the TENSORRT_DEVICE env var) "
             "--model openvino:models/yolov8s_openvino.xml "
             "--model openvino_int8:models/yolov8s_openvino_int8.xml "
             "(openvino device is selected via the OPENVINO_DEVICE env var)"

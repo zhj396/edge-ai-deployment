@@ -150,7 +150,7 @@ class TensorRTBuildConfig:
     # INT8 QDQ-path only: calibration method for the quantize_onnx_to_int8 step.
     # Entropy (KL-divergence) may fit tight activation distributions better
     # under the forced SYMMETRIC quantization TRT requires
-    # (ActivationSymmetric=True). No-op for the
+    # (ActivationSymmetric=True) (see docs/TENSORRT.md). No-op for the
     # --calibrator path (TRT's own IInt8EntropyCalibrator2 runs then).
     calib_method: str = "MinMax"
 
