@@ -255,6 +255,17 @@ def quantize_onnx_to_int8(
     if not fp32_path.exists():
         raise FileNotFoundError(f"Model not found: {fp32_path}")
 
+    # ``existing_validation`` accepts .xml/.bin for the openvino command
+    # group, so a mispointed --model passes path validation and would reach
+    # onnx.load_model. Reject a non-.onnx suffix here, with the owning
+    # command group named.
+    if fp32_path.suffix.lower() != ".onnx":
+        raise ValueError(
+            f"ORT INT8 quantization expects an ONNX file (.onnx), got: "
+            f"{fp32_path}. OpenVINO IR files (.xml/.bin) belong to the "
+            f"`openvino` command group."
+        )
+
     # Validate the calibration method up front, before the expensive preprocess/sample stages:
     # only 'MinMax' and 'Entropy' map to a CalibrationMethod; anything else is a hard error.
     if method == "MinMax":

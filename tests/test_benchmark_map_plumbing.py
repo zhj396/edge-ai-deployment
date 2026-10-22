@@ -38,3 +38,48 @@ def test_compute_map_native_unsupported_backend():
     assert result is None
     assert source in SUPPORTED_SOURCES
     assert source.startswith("unsupported backend")
+
+
+def test_run_all_continues_past_failed_backend(monkeypatch):
+    """A backend whose run raises is logged and omitted; the loop continues
+    and the remaining backends land in the summary — the same
+    omit-and-summarize contract as OpenVINOEngine.infer's failed batches."""
+    b = Benchmark.__new__(Benchmark)
+    b.validation = False
+    b.timestamp_suffix = "_test"  # summary_csv_path interpolates this
+
+    # summary_csv_path points at results/ — stub the CSV write so the test
+    # stays hermetic (the DataFrame under test is the return value below).
+    written = {}
+    import pandas as pd
+
+    def _fake_to_csv(self, path, **kwargs):
+        written["path"] = str(path)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", _fake_to_csv)
+
+    calls = []
+
+    def _ok(backend, model_path):
+        calls.append(backend)
+        return {
+            "device": "cpu", "batch_size": 1, "mean_total_s": 1.0,
+            "mean_batch_s": 0.5, "mean_image_s": 0.5, "fps": 2.0,
+            "latency_ms_mean": 500.0,
+        }
+
+    def _boom(backend, model_path):
+        raise RuntimeError("openvino is not installed")
+
+    monkeypatch.setattr(b, "_run_pytorch", _ok)
+    monkeypatch.setattr(b, "_run_openvino", _boom)
+    monkeypatch.setattr(b, "_run_onnx", _ok)
+
+    df = b.run_all({
+        "pytorch": "models/yolov8s.pt",
+        "openvino": "models/yolov8s_openvino.xml",
+        "onnx_fp32": "models/yolov8s_fp32.onnx",
+    })
+
+    assert calls == ["pytorch", "onnx_fp32"]
+    assert list(df["Backend"]) == ["pytorch", "onnx_fp32"]

@@ -145,3 +145,19 @@ def test_stratified_sampling_is_hash_seed_deterministic(data_dir):
     assert outputs[0] == outputs[1], (
         "selection differs across PYTHONHASHSEED — sampler is not reproducible"
     )
+
+
+def test_quantize_onnx_to_int8_rejects_non_onnx_suffix(tmp_path):
+    """``existing_validation`` accepts .xml/.bin for the openvino command
+    group, so a mispointed --model reaches the quantizer — it fails here
+    with the owning command group named, ahead of onnx.load_model."""
+    from src.quantize import quantize_onnx_to_int8
+
+    xml = tmp_path / "yolov8s_openvino.xml"
+    xml.write_text("<net/>")
+    with pytest.raises(ValueError, match="expects an ONNX file"):
+        quantize_onnx_to_int8(
+            onnx_fp32_path=str(xml),
+            onnx_int8_path=str(tmp_path / "int8.onnx"),
+            calibration_imgs=str(tmp_path),
+        )

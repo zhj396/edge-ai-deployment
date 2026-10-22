@@ -5,6 +5,35 @@ from . import DEFAULT_MODEL_FP32, ExportConfig
 
 logger = get_logger(__name__)
 
+# Default opset for both ``export`` and cli/openvino.py's auto-export
+# fallback.
+DEFAULT_OPSET = 17
+
+
+def export_model(cfg):
+    """Run the export workflow from a populated :class:`ExportConfig`.
+
+    Shared by the ``export`` command and the ``openvino convert``
+    auto-export fallback.
+    """
+    # Deferred: src.export pulls in torch + ultralytics + onnx(onnxruntime);
+    # keeping it here lets `main.py --help` and parser construction stay cheap.
+    from src import model_export
+
+    logger.info(f"Exporting {cfg.model} -> {cfg.output}")
+    model_export(
+        model_path=cfg.model,
+        output_path=cfg.output,
+        imgsz=cfg.imgsz,
+        opset=cfg.opset,
+        dynamic=cfg.dynamic,
+        simplify=cfg.simplify,
+        device=cfg.device,
+        nms=cfg.nms,
+        validate=cfg.validate,
+    )
+    logger.info("Export complete")
+
 
 # =========================================================
 # Add CLI subparser
@@ -24,7 +53,7 @@ def add_parser(subparsers):
     )
     parser.add_argument("--output", type=Path, default=DEFAULT_MODEL_FP32)
     parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--opset", type=int, default=DEFAULT_OPSET)
     parser.add_argument("--no-dynamic", action="store_true")
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument(
@@ -41,10 +70,6 @@ def add_parser(subparsers):
 # Run export command
 # =========================================================
 def run(args):
-    # Deferred: src.export pulls in torch + ultralytics + onnx(onnxruntime);
-    # keeping it here lets `main.py --help` and parser construction stay cheap.
-    from src import model_export
-
     cfg = ExportConfig(
         model=args.model,
         output=args.output,
@@ -56,16 +81,4 @@ def run(args):
         nms=args.nms,
         validate=not args.no_validate,
     )
-    logger.info(f"Exporting {cfg.model} -> {cfg.output}")
-    model_export(
-        model_path=cfg.model,
-        output_path=cfg.output,
-        imgsz=cfg.imgsz,
-        opset=cfg.opset,
-        dynamic=cfg.dynamic,
-        simplify=cfg.simplify,
-        device=cfg.device,
-        nms=cfg.nms,
-        validate=cfg.validate,
-    )
-    logger.info("Export complete")
+    export_model(cfg)

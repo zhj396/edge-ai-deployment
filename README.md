@@ -14,8 +14,8 @@ benchmark figures are tracked in [docs/ARCHITECTURE.md
 
 The deploy half lands in milestones; the currently reproducible commands are
 **`export`**, **`inspect`**, **`quantize`**, **`infer`**, **`consistency`**,
-and **`benchmark`**; a C++ inference API follows once the ONNX Runtime path is
-complete.
+**`benchmark`**, and **`openvino`** (the OpenVINO backend is an optional
+dependency — [docs/OPENVINO.md](docs/OPENVINO.md)).
 
 > A full architecture deep-dive — pipeline, quantization policy, consistency gates, benchmarking —
 > lives in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
@@ -48,7 +48,7 @@ complete.
 
 | Capability                  | Implementation                                                                                                                                            |
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Multi-backend inference** | `YOLOv8Engine`: one `infer()` API across `pytorch`, `onnx_fp32`, `onnx_int8` × `cpu`/`cuda` — all backends share the same preprocess / post-process pipeline; the `infer` CLI and a `preprocess_imgs`-backed batch loop sit on top. Fixed-shape ONNX inputs are honored: the static batch dim sizes each forward, and a mismatched `imgsz` is rejected at init. |
+| **Multi-backend inference** | `YOLOv8Engine`: one `infer()` API across `pytorch`, `onnx_fp32`, `onnx_int8` × `cpu`/`cuda` — all backends share the same preprocess / post-process pipeline; the `infer` CLI and a `preprocess_imgs`-backed batch loop sit on top. Fixed-shape ONNX inputs are honored: the static batch dim sizes each forward, and a mismatched `imgsz` is rejected at init. `OpenVINOEngine` / `OpenVINOAsyncEngine` mirror the same `infer()` / `infer_frames()` API for OpenVINO IR (FP16/INT8) on CPU / Intel iGPU (see [docs/OPENVINO.md](docs/OPENVINO.md)). |
 | **YOLOv8 → ONNX export**    | opset 17, dynamic shape by default, ONNX simplifier; runtime-validated session (structural check, shape inference, ORT probe incl. dynamic-batch check).  |
 | **ONNX model inspection**   | sha256, file size, opset, I/O names and shapes; optional two-model side-by-side comparison.                                                               |
 | **Static INT8 PTQ (QDQ)**   | `quant_pre_process` → `quantize_static`: QUInt8 asymmetric activations, QInt8 symmetric per-channel weights, `MinMax` or `Entropy` (KL-divergence) calibration. |
@@ -60,7 +60,7 @@ complete.
 | **Post-processing**         | `post_process`: NMS via Ultralytics `non_max_suppression`, letterbox→original scale-back via `scale_boxes`, per-image clipping, `[(x1, y1, x2, y2, conf, cls), …]` tuples in original-image coordinates; accepts `np.ndarray` / `torch.Tensor` / list outputs in either `(bs, 4+nc, N)` or `(bs, N, 4+nc)` layout. |
 | **CUDA IO Binding via DLPack** | On CUDA the engine binds the input `torch.Tensor` as an on-device `OrtValue` via DLPack (zero host→device copy) and copies outputs back once per inference; the CPU path is plain numpy `session.run`. Warm-up runs the deployed per-backend/per-device path. |
 | **Path validation**         | `existing_validation` + `PathValidationError` (an `argparse.ArgumentTypeError`, so argparse prints the message verbatim); missing paths under `models/` or `data/` point at [ARTIFACTS.md](ARTIFACTS.md). |
-| **Lazy domain imports**      | `src` resolves domain attributes via PEP 562 `__getattr__`; a bare `import src` stays dependency-light — submodules load on first attribute access. `export` defers its domain import into `run()`; `quantize`, `infer`, `consistency`, and `benchmark` bind at module level, so `main.py` startup loads torch / torchvision / onnx / onnxruntime / cv2 / imagehash / ultralytics / pandas / psutil, plus numpy / tqdm / Pillow / PyYAML. |
+| **Lazy domain imports**      | `src` resolves domain attributes via PEP 562 `__getattr__`; a bare `import src` stays dependency-light — submodules load on first attribute access. `quantize`, `infer`, `consistency`, and `benchmark` bind at module level, so `main.py` startup loads torch / torchvision / onnx / onnxruntime / cv2 / imagehash / ultralytics / pandas / psutil, plus numpy / tqdm / Pillow / PyYAML. The OpenVINO modules import `openvino` / `nncf` under `try/except` with availability predicates and stay importable without them. |
 | **Operational hygiene**     | Rotating file + console logging, third-party logs raised to WARNING, per-module logger names; `gc.collect()` + `malloc_trim(0)` (Linux/glibc only) between benchmark backends so the RSS delta reflects only the current backend. |
 
 ---
@@ -75,7 +75,8 @@ main.py  —  command registry + logging setup
                             letterbox preprocessing, post-processing,
                             unified inference engine, INT8 quantization,
                             calibration sampler, two-model consistency
-                            validation, performance benchmark
+                            validation, performance benchmark,
+                            OpenVINO convert / engine (optional dep)
   utils/   cross-cutting helpers: logging, path validation, I/O, metadata,
            CPU threading, percentiles  (imported from cli/ and src/)
   tests/   unit tests (no model / GPU required)
@@ -93,17 +94,19 @@ main.py  —  command registry + logging setup
   coordinates); a unified inference engine (`YOLOv8Engine`: pytorch / onnx_fp32 / onnx_int8 ×
   cpu / cuda); static INT8 quantization (calibration reader over `preprocess_imgs` +
   `quantize_static`); calibration sampler (stratified → phash dedup → farthest-first);
-  two-model consistency validation (`ModelWrapper` over PT / ONNX, tensor and
+  two-model consistency validation (`ModelWrapper` over PT / ONNX / OpenVINO IR, tensor and
   detection comparison from `utils.comparison`); a performance benchmark
   (`Benchmark`: per-backend timed loops over the shared preprocess → forward
   → post-process pipeline, percentile latency, FPS, peak memory, optional
-  native mAP validation).
+  native mAP validation); the OpenVINO backend (ONNX → IR conversion + NNCF
+  INT8 quantization and `OpenVINOEngine` / `OpenVINOAsyncEngine`, optional dep).
 * **`utils/`** — logging (rotating file + console), path validation, image discovery, visualization,
   ONNX metadata + SHA-256, percentiles, CPU-thread configuration.
 * **`tests/`** — unit tests; model-free so they run on any laptop (`test_postprocess.py`,
   `test_preprocess.py`, `test_benchmark_map_plumbing.py`,
-  `test_consistency_ort_forward.py`, and `test_train_staged_retry.py`
-  additionally pull torch — the last one at fixture time).
+  `test_consistency_ort_forward.py`, `test_openvino_optional_imports.py`, and
+  `test_train_staged_retry.py` additionally pull torch — the last one at
+  fixture time).
 * **`docker/`** — FastAPI inference server (`docker/server.py`) plus the toolchain / server
   Dockerfiles; both images install the pinned `requirements-cpu.txt` stack verbatim
   (see [docs/DOCKER.md](docs/DOCKER.md)).
@@ -115,7 +118,7 @@ main.py  —  command registry + logging setup
 ```
 edge-ai-deployment/
 ├── main.py                    # CLI entry: dispatches to cli/*
-├── clean.sh                   # Reset: drop *.onnx, *.cache, *.tmp, caches, logs/, results/, runs/
+├── clean.sh                   # Reset: drop *.onnx, *.xml/.bin IR, *.cache, *.tmp, caches, logs/, results/, runs/
 ├── ARTIFACTS.md               # Where models/ + data/ come from: Release assets, sha256-pinned
 ├── pyproject.toml             # black / isort / pytest config
 ├── .flake8                    # flake8 config (flake8 7.x does not read pyproject.toml)
@@ -126,10 +129,12 @@ edge-ai-deployment/
 ├── requirements.txt           # Core runtime deps (shared CPU/GPU; no torch/ORT) + dev tools
 ├── requirements-cpu.txt       # CPU overlay: +cpu torch/torchvision wheels, onnxruntime
 ├── requirements-kaggle.txt    # GPU overlay: keeps preinstalled CUDA torch; onnxruntime-gpu
+├── requirements-openvino.txt  # OpenVINO overlay: openvino + nncf (optional backend)
 │
 ├── docs/
 │   ├── ARCHITECTURE.md        # Architecture deep-dive: pipeline, quantization, benchmarking
 │   ├── DOCKER.md              # Docker images: build, run, server env vars, troubleshooting
+│   ├── OPENVINO.md            # OpenVINO backend: convert, NNCF INT8, devices, benchmarking
 │   └── TRAINING.md            # Training docs: subset build, analysis, staged long-tail
 │
 ├── train/                     # Training upstream: COCO 12-class subset build + YOLOv8s training
@@ -142,7 +147,8 @@ edge-ai-deployment/
 │   ├── quantize.py            # `quantize`— ONNX FP32 → INT8 (QDQ)
 │   ├── infer.py               # `infer`   — batch inference + visualization
 │   ├── consistency.py         # `consistency` — two models, tensor or detection mode
-│   └── benchmark.py           # `benchmark` — p50/p90/p95/p99, FPS, RSS, mAP
+│   ├── benchmark.py           # `benchmark` — p50/p90/p95/p99, FPS, RSS, mAP
+│   └── openvino.py            # `openvino` — convert / quantize (NNCF INT8) / run
 │
 ├── src/                       # Domain logic
 │   ├── __init__.py            # PEP 562 lazy re-exports
@@ -154,7 +160,9 @@ edge-ai-deployment/
 │   ├── quantize.py            # YOLOv8CalibrationDataReader + static QDQ quantization
 │   ├── sampler.py             # CalibrationSampler: stratified + phash + farthest-first
 │   ├── consistency.py         # ModelWrapper + tensor & detection comparison
-│   └── benchmark.py           # Benchmark class: latency / throughput / memory / mAP
+│   ├── benchmark.py           # Benchmark class: latency / throughput / memory / mAP
+│   ├── openvino_convert.py    # ONNX → OpenVINO IR + NNCF INT8 quantization
+│   └── openvino_engine.py     # OpenVINOEngine / OpenVINOAsyncEngine (same infer() API)
 │
 ├── utils/                     # Cross-cutting helpers
 │   ├── __init__.py
@@ -181,9 +189,14 @@ edge-ai-deployment/
     ├── test_engine_batch.py   # Fixed-batch chunking: even split, pad + keep on a short last chunk
     ├── test_consistency.py    # compute_iou, compare_tensors, compare_detections, re-export identity
     ├── test_consistency_ort_forward.py  # ort_forward/get_ort_session CPU path (in-memory ONNX)
-    ├── test_quantize.py       # Calibration-reader regressions (_filter_readable, hash-seed determinism)
+    ├── test_quantize.py       # Calibration-reader regressions (_filter_readable, hash-seed determinism,
+    │                          non-.onnx --model rejection)
     ├── test_map_eval.py       # Native mAP evaluator: IoU, COCO AP scenarios, GT loader
-    ├── test_benchmark_map_plumbing.py  # benchmark --validation ↔ map_eval wiring
+    ├── test_benchmark_map_plumbing.py  # benchmark --validation ↔ map_eval wiring,
+    │                          run_all failed-backend isolation
+    ├── test_openvino_optional_imports.py  # OpenVINO optional-dep + device preflight +
+    │                          suffix-ownership guards
+    ├── test_cli_openvino_convert.py  # openvino convert ONNX resolution / auto-export
     ├── test_cli_output_paths.py  # Per-run timestamped artifact contract
     └── test_train_staged_retry.py  # train_staged retry/resume state machine (loaded by file path)
 ```
@@ -212,6 +225,11 @@ pip install -r requirements-cpu.txt
 > **Docker:** both a full-CLI toolchain image and a FastAPI inference-server image install the
 > pinned `requirements-cpu.txt` stack verbatim — build and run instructions live in
 > [docs/DOCKER.md](docs/DOCKER.md).
+
+> **OpenVINO (optional):** the OpenVINO backend installs as an overlay on top of
+> `requirements-cpu.txt` — `pip install -r requirements-openvino.txt` (pinned
+> `openvino==2026.3.0` + `nncf==3.3.0`). Without it the rest of the toolchain
+> works unchanged; see [docs/OPENVINO.md](docs/OPENVINO.md).
 
 The `models/` directory must contain:
 
@@ -261,6 +279,11 @@ python main.py infer --backend onnx_int8 --model models/yolov8s_int8.onnx --imgs
 python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:models/yolov8s_fp32.onnx --model onnx_int8:models/yolov8s_int8.onnx --imgs-input data --validation --warmup 10 --runs 25
 ```
 
+> **OpenVINO backend (optional):** IR conversion, NNCF INT8 quantization, inference,
+> and consistency runs against the ONNX FP32 baseline (`openvino:` / `openvino_int8:`
+> model prefixes in `consistency` and `benchmark`) — see
+> [docs/OPENVINO.md](docs/OPENVINO.md).
+
 ---
 
 ## CLI Reference
@@ -271,8 +294,9 @@ python main.py benchmark --model pytorch:models/yolov8s.pt --model onnx_fp32:mod
 | `inspect`| Print ONNX metadata (sha256, opset, I/O, size, producer).  | `--model` (req) · `--compare`                                                                                                              |
 | `quantize`| ONNX FP32 → INT8 (QDQ, **MinMax** or **Entropy** calibration). | `--model` · `--output` · `--imgs-input` · `--imgsz 640` · `--batch-size 1` · `--method MinMax` · `--max-cal-samples 300` · `--resnet50` · `--device cpu` |
 | `infer`   | End-to-end inference with annotated overlays. | `--backend onnx_fp32` · `--model` · `--imgs-input` (req) · `--output-dir` · `--imgsz 640` · `--batch-size 8` · `--conf 0.25` · `--iou 0.45` · `--max-det 300` · `--max-imgs 32` · `--no-save` · `--device cpu` |
-| `consistency` | Two-model comparison: `tensor` (strict allclose) for export regressions · `detection` (per-image IoU / class / score gates) for INT8 regressions. Timestamped JSON report (`consistency_report_<TS>.json`) + failed-sample copies; exit code 1 on FAIL. | `--model1` · `--model2` · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes 640` · `--batch-sizes 1` · `--atol 1e-3` · `--rtol 1e-2` · `--resnet50` · `--device cpu` · `--report-path results/consistency_report.json` (per-run `<TS>` inserted between stem and suffix) |
-| `benchmark` | Latency / throughput / memory; optional **mAP** validation (native evaluator over each backend's `infer()`; summary CSV records `mAP50` / `mAP50-95` / `mAP_source`). | `--model backend:path` (repeatable) · `--imgs-input` · `--imgsz 640` · `--batch-size 1` · `--max-images 16` · `--warmup 10` · `--runs 25` · `--validation` · `--conf-threshold 0.001` · `--iou-threshold 0.7` · `--speed-conf 0.25` · `--speed-iou 0.45` · `--resnet50` · `--device cpu` · `--no-sampler` |
+| `consistency` | Two-model comparison: `tensor` (strict allclose) for export regressions · `detection` (per-image IoU / class / score gates) for INT8 regressions. Timestamped JSON report (`consistency_report_<TS>.json`) + failed-sample copies; exit code 1 on FAIL. | `--model1` · `--model2` (`openvino:` / `openvino_int8:` on either side select the OpenVINO backend, device via the `OPENVINO_DEVICE` env var) · `--imgs-input` · `--mode tensor` · `--max-images 20` · `--img-sizes 640` · `--batch-sizes 1` · `--atol 1e-3` · `--rtol 1e-2` · `--resnet50` · `--device cpu` · `--report-path results/consistency_report.json` (per-run `<TS>` inserted between stem and suffix) |
+| `benchmark` | Latency / throughput / memory; optional **mAP** validation (native evaluator over each backend's `infer()`; summary CSV records `mAP50` / `mAP50-95` / `mAP_source`). | `--model backend:path` (repeatable; `openvino:` / `openvino_int8:` select the OpenVINO backend, device via the `OPENVINO_DEVICE` env var) · `--imgs-input` · `--imgsz 640` · `--batch-size 1` · `--max-images 16` · `--warmup 10` · `--runs 25` · `--validation` · `--conf-threshold 0.001` · `--iou-threshold 0.7` · `--speed-conf 0.25` · `--speed-iou 0.45` · `--resnet50` · `--device cpu` · `--no-sampler` |
+| `openvino` | OpenVINO backend entry point: `convert` (ONNX → IR, FP16 default), `quantize` (NNCF INT8), `run` (inference). See [docs/OPENVINO.md](docs/OPENVINO.md). | `convert` · `quantize` · `run` · `--model` · `--output` · `--imgsz 640` · `--no-fp16` · `--imgs-input` · `--max-cal-samples 300` · `--subset-size 64` · `--smooth-quant` · `--resnet50` · `--device CPU` · `--num-streams AUTO` · `--max-imgs 32` · `--batch-size 8` · `--conf 0.25` · `--iou 0.45` · `--data` · `--output-dir` |
 
 ---
 
@@ -354,9 +378,11 @@ Unit tests; **no model or GPU required**:
 | `tests/test_engine_batch.py` | `_batch_chunks` fixed-batch chunking: even split, short-final-chunk pad + `keep` count, batch-of-one, empty input. |
 | `tests/test_consistency.py` | `compute_iou`, `compare_tensors` (tensor / detection modes, shape mismatch, NaN detection), `compare_detections` (empty / identical / no-match / count-diff), `src.consistency` re-export identity, `consistency` parser defaults (`--report-path`), ultralytics-free purity guard. |
 | `tests/test_cli_output_paths.py` | Per-run timestamp contract: report path derivation (no double extension, stays under `--report-path`'s dir), distinct stems keep independent reports, consistency exit codes, plus a dependency-free compile smoke over the CLI/src entry modules. |
-| `tests/test_quantize.py` | Calibration-reader regressions: `_filter_readable` keep/drop behavior (garbage / missing / directory), all-unreadable constructor raise, stratified-sampling PYTHONHASHSEED determinism (data-gated). |
+| `tests/test_quantize.py` | Calibration-reader regressions: `_filter_readable` keep/drop behavior (garbage / missing / directory), all-unreadable constructor raise, stratified-sampling PYTHONHASHSEED determinism (data-gated), non-`.onnx` `--model` rejection (the `.xml`/`.bin` suffixes belong to the `openvino` command group). |
 | `tests/test_map_eval.py` | Native mAP evaluator: `box_iou` (known / empty / degenerate), synthetic COCO AP scenarios with hand-computed expected values (missed GT, FP-after-TP, cross-image matching, zero-GT class exclusion), data-guarded GT loader alignment. |
-| `tests/test_benchmark_map_plumbing.py` | `benchmark --validation` ↔ native evaluator wiring: `_compute_map_native` dispatch target exists; the unsupported-backend path returns without constructing any engine. |
+| `tests/test_benchmark_map_plumbing.py` | `benchmark --validation` ↔ native evaluator wiring: `_compute_map_native` dispatch target exists; the unsupported-backend path returns without constructing any engine; `run_all` isolates a failed backend (logged + omitted, the remaining backends land in the summary). |
+| `tests/test_openvino_optional_imports.py` | OpenVINO optional-dependency surface: `_LAZY` resolution, `ImportError` without openvino/nncf, conversion-availability ⇒ `ov` bound, device preflight (`validate_device_request` fallback/reject contract), static-batch padding, engine-call parity (`infer_frames` empty-list reject, failed-batch summary), NNCF SmoothQuant gate (opt-in), suffix-ownership guards on the non-OpenVINO loaders (engine pytorch/onnx, export). |
+| `tests/test_cli_openvino_convert.py` | `openvino convert` ONNX resolution: existing-file pass-through, missing-ONNX auto-export from `.pt` (export-flag parity), missing-both error. |
 | `tests/test_utils.py` | `cosine_similarity`, `percentiles`/`summarize_runs`, `color_for_class`, `draw_detections`, `existing_validation` (+ `PathValidationError` ARTIFACTS.md hint), `onnx_only` path validation, `sha256_of_file`, `file_size_mb`, `clamp_workers`, `compare_models`, cross-package `__version__` consistency. |
 | `tests/test_train_staged_retry.py` | Staged-training retry/resume state machine (`train/train_staged/utils.py`, loaded by file path). Imports numpy/torch/yaml only; no ultralytics. |
 
@@ -374,10 +400,9 @@ GitHub Actions runs the same two gates on every push to and pull request against
 * **Static INT8 only.** Dynamic quantization and QAT each need a separate
   pipeline; the head-exclusion policy (whole `/model.22/` FP32) would need
   re-tuning for QAT-trained models.
-* **Deploy-half milestones land incrementally.** The remaining backends —
-  OpenVINO and TensorRT — enter the CLI with their milestones; the intro
-  paragraph states the target lifecycle. A C++ inference API follows once the
-  ONNX Runtime path is complete.
+* **Deploy-half milestones land incrementally.** Backends enter the CLI with
+  their milestones; the currently reproducible set is PyTorch, ONNX Runtime,
+  and OpenVINO — the intro paragraph lists the commands.
 * **YOLOv8s 12-class COCO subset only.** The post-processing layout heuristic
   (permute to `(bs, 4+nc, N)` when `shape[1] > shape[2]` and `shape[1] > SMALL`)
   assumes `num_boxes >> 4+nc` — always true for YOLOv8 at 640px (`N=8400`,

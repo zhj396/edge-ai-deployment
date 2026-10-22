@@ -34,6 +34,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from utils import (
+    PathValidationError,
     get_logger,
     select_providers,
 )
@@ -114,21 +115,93 @@ def ort_forward(
 # Unified model wrapper
 # ---------------------------------------------------------------------------
 class ModelWrapper:
-    """Unified forward interface for PyTorch (``.pt`` / ``.pth``) and ONNX models."""
+    """Unified interface for PyTorch, ONNX, and OpenVINO-IR models.
+
+    ``model_path`` additionally accepts a ``backend:path`` spec:
+    ``openvino:models/yolov8s_openvino.xml`` or ``openvino_int8:models/...
+    ``. Both prefixes load the same :class:`~src.openvino_engine.OpenVINOEngine`
+    (the precision is opaque to the wrapper — the ``_int8`` alias exists so
+    the two precision variants stay visually distinct in commands). The
+    plain ``.pt`` / ``.pth`` / ``.onnx`` forms are unchanged.
+    """
+
+    # Prefixes that route to OpenVINOEngine (both alias the same engine).
+    OPENVINO_PREFIXES = ("openvino_int8:", "openvino:")
 
     def __init__(self, model_path: str, device: str) -> None:
-        self.path = str(model_path)
+        spec = str(model_path)
+        self.openvino_backend: Optional[str] = None
+        for prefix in self.OPENVINO_PREFIXES:
+            if spec.startswith(prefix):
+                # Strip exactly ``len(prefix)`` characters from the head of
+                # the spec; the path text is preserved verbatim.
+                self.openvino_backend = spec[len(prefix):]
+                break
+        # The full spec (with prefix) is not preserved anywhere downstream.
+        # ``is not None``, not truthiness: a bare "openvino:" (empty path)
+        # must keep the empty stripped path — falling back to the prefixed
+        # spec would put the prefix back into every downstream path check.
+        self.path = spec if self.openvino_backend is None else self.openvino_backend
         self.device = (
             "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
-        self.type = (
-            "pt" if Path(self.path).suffix.lower() in (".pt", ".pth") else "onnx"
-        )
+        if self.openvino_backend is not None:
+            self.type = "openvino"
+        else:
+            suffix = Path(self.path).suffix.lower()
+            self.type = "pt" if suffix in (".pt", ".pth") else "onnx"
         self.model = self._load_model()
 
     def _load_model(self):
+        if self.type == "openvino":
+            if not Path(self.path).exists():
+                raise FileNotFoundError(f"Model file not found: {self.path}")
+            # Fail fast on a wrong suffix before the heavy import: a
+            # non-.xml path raises PathValidationError naming the actual
+            # path, ahead of the lazy engine import.
+            if Path(self.path).suffix.lower() != ".xml":
+                raise PathValidationError(
+                    f"openvino backend expects an OpenVINO IR (.xml), "
+                    f"got: {self.path}"
+                )
+            # Deferred: OpenVINOEngine is an optional dependency
+            # (requirements-openvino.txt) and pulls the full engine stack;
+            # keeping it inside the openvino branch lets PT/ONNX
+            # consistency runs proceed without openvino installed.
+            from .openvino_engine import OpenVINOEngine
+
+            # OpenVINO consumes host numpy, so the CUDA-or-CPU torch device
+            # does not apply here: the device comes from the
+            # ``OPENVINO_DEVICE`` env var (default CPU) via the engine's own
+            # preflight, and the resolved value is recorded below so the
+            # report can state what actually ran.
+            requested = os.environ.get("OPENVINO_DEVICE", "CPU")
+            engine = OpenVINOEngine(model_path=self.path, device=requested)
+            self.openvino_device = {
+                "requested_device": requested.upper(),
+                "actual_device": engine.device,
+            }
+            logger.info(
+                "OpenVINO model loaded: %s | requested_device=%s | "
+                "actual_device=%s",
+                self.path, requested.upper(), engine.device,
+            )
+            return engine
+
         if not Path(self.path).exists():
             raise FileNotFoundError(f"Model file not found: {self.path}")
+
+        # Suffix gate: existing_validation accepts .xml/.bin for the openvino
+        # command group, so a mispointed --model1/--model2 can reach this
+        # wrapper with a suffix its loader cannot read. Reject it ahead of
+        # the YOLO()/ORT load, with the owning prefix named — the openvino:
+        # prefixes above are the only consumers of those suffixes.
+        if Path(self.path).suffix.lower() not in (".pt", ".pth", ".onnx"):
+            raise PathValidationError(
+                f"consistency expects a .pt/.pth checkpoint or an ONNX file, "
+                f"got: {self.path}. OpenVINO IR files (.xml/.bin) are served "
+                f"through the openvino:/openvino_int8: prefixes."
+            )
 
         try:
             if self.type == "pt":
@@ -145,6 +218,13 @@ class ModelWrapper:
             raise RuntimeError(f"Cannot load model {self.path}") from e
 
     def forward(self, x: torch.Tensor) -> np.ndarray:
+        if self.type == "openvino":
+            # OpenVINO consumes host numpy: the torch CUDA tensor is copied
+            # to host before the forward (a --device cuda run with an
+            # OpenVINO model is a cross-device comparison; the host copy is
+            # part of that path's contract).
+            batch = x.detach().cpu().numpy().astype(np.float32)
+            return self.model._forward(batch)
         if self.type == "pt":
             return pt_forward(self.model, x)
         return ort_forward(self.model, x, self.device)
@@ -223,6 +303,14 @@ def validate_consistency(
 
     model_obj1 = ModelWrapper(model1, device)
     model_obj2 = ModelWrapper(model2, device)
+
+    # Device provenance for an OpenVINO side: requested vs actual (a GPU
+    # request that no enumerated device can serve resolves to the engine's
+    # warned CPU fallback, so the report states what actually ran).
+    openvino_provenance: Dict[str, Dict] = {}
+    for obj in (model_obj1, model_obj2):
+        if obj.type == "openvino" and getattr(obj, "openvino_device", None):
+            openvino_provenance[obj.path] = obj.openvino_device
 
     data_yaml = Path(imgs_input) / "data.yaml"
     if not data_yaml.exists():
@@ -430,6 +518,8 @@ def validate_consistency(
 
     overall_pass = all(r["overall_status"] == "PASS" for r in results)
     final_result = {"results": results, "overall_pass": overall_pass, "mode": mode}
+    if openvino_provenance:
+        final_result["openvino_devices"] = openvino_provenance
     # Final dump supersedes the last incremental write with the complete
     # record, adding ``overall_pass`` — the incremental writes omit it
     # because the verdict only exists once every (imgsz, batch) config has

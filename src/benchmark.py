@@ -239,7 +239,11 @@ class Benchmark:
         Any crash (engine construction included) is caught and logged — the
         benchmark run continues, the row just carries no mAP.
         """
-        supported = backend in ("pytorch", "onnx_fp32", "onnx_int8")
+        supported = (
+            backend == "pytorch"
+            or backend in ("onnx_fp32", "onnx_int8")
+            or backend.startswith("openvino")
+        )
         if not supported:
             logger.warning(
                 "mAP unsupported for %s: no Python engine to drive "
@@ -248,17 +252,37 @@ class Benchmark:
             return None, "unsupported backend (no Python engine to drive)"
 
         from utils.map_eval import evaluate_map
-        from . import YOLOv8Engine
+        from . import YOLOv8Engine, OpenVINOEngine, openvino_available
 
         data_yaml = Path(self.imgs_input) / "data.yaml"
         logger.info("Computing mAP (native evaluator) for %s...", backend)
 
         engine = None
         try:
-            engine = YOLOv8Engine(
-                model_path=model_path, backend=backend,
-                imgsz=self.imgsz, device=self.device,
-            )
+            if backend == "pytorch":
+                engine = YOLOv8Engine(
+                    model_path=model_path, backend="pytorch",
+                    imgsz=self.imgsz, device=self.device,
+                )
+            elif backend in ("onnx_fp32", "onnx_int8"):
+                engine = YOLOv8Engine(
+                    model_path=model_path, backend=backend,
+                    imgsz=self.imgsz, device=self.device,
+                )
+            elif backend.startswith("openvino"):
+                if not openvino_available():
+                    raise RuntimeError(
+                        "openvino is not installed. Run: "
+                        "pip install -r requirements-openvino.txt"
+                    )
+                # Device follows OPENVINO_DEVICE (default CPU) — same posture
+                # as _run_openvino (--device is irrelevant for OpenVINO since
+                # it takes host numpy).
+                ov_device = os.environ.get("OPENVINO_DEVICE", "CPU")
+                engine = OpenVINOEngine(
+                    model_path=model_path, device=ov_device,
+                    imgsz=self.imgsz, data_yaml=data_yaml,
+                )
 
             result = evaluate_map(
                 engine=engine,
@@ -363,6 +387,61 @@ class Benchmark:
         metrics["device"] = providers[0] if providers else str(self.device)
         return metrics
 
+    # openvino path
+    def _run_openvino(self, backend: str, model_path: str) -> Dict:
+        """OpenVINO IR / ONNX via the OpenVINO runtime.
+
+        The OpenVINO *device* (CPU / GPU / AUTO) is selected via the
+        ``OPENVINO_DEVICE`` env var, not ``--device`` — ``--device`` still
+        controls only where preprocess runs (and is irrelevant here: OpenVINO
+        takes host numpy, so we always preprocess on CPU). Mirrors the
+        ``_run_onnx`` shape: compile once, then the timed loop feeds the
+        shared preprocess -> forward -> post_process pipeline.
+        """
+        baseline = self._baseline_memory()
+
+        from . import OpenVINOEngine, openvino_available
+
+        if not openvino_available():
+            raise RuntimeError(
+                "OpenVINO not installed; run: pip install -r requirements-openvino.txt"
+            )
+        device = os.environ.get("OPENVINO_DEVICE", "CPU")
+        engine = OpenVINOEngine(
+            model_path=model_path, device=device, imgsz=self.imgsz,
+        )
+        # Cap to the model's per-forward batch: a static-batch IR (e.g. one
+        # converted from a static-batch ONNX) rejects batch>1 at the DFL
+        # reshape. The reported FPS/latency stay correct either way.
+        eff = engine._effective_batch(self.batch_size)
+
+        batches = list(self._build_batches(self.speed_imgs, eff))
+        if not batches:
+            raise RuntimeError("No images available for benchmarking")
+
+        def forward(pre: Dict):
+            return engine._forward(pre["images"].cpu().numpy())
+
+        metrics = self._timed_end_to_end(
+            backend, model_path, batches, forward, baseline
+        )
+        # Record the device that *actually* executed, not the
+        # OPENVINO_DEVICE request: engine.device is the resolved value from
+        # validate_device_request's preflight, so an unservable request
+        # (e.g. GPU without an Intel GPU driver) that fell back to CPU is
+        # reported as CPU. Keep the request alongside so the fallback stays
+        # visible in the results.
+        metrics["device"] = engine.device
+        if engine.device != device.upper():
+            metrics["requested_device"] = device.upper()
+        # When a static-batch IR capped eff below the requested
+        # --batch-size, "batch_size" reports what *actually* ran per forward
+        # (eff); keep the requested value alongside.
+        if eff != self.batch_size:
+            metrics["requested_batch_size"] = self.batch_size
+            metrics["batch_size"] = eff
+        return metrics
+
     def _timed_end_to_end(
         self,
         backend: str,
@@ -428,7 +507,8 @@ class Benchmark:
             try:
                 # DLPack requires a contiguous tensor.
                 ort_input = ort.OrtValue.from_dlpack(to_dlpack(tensor.contiguous()))
-                # Same barrier as YOLOv8Engine._forward: the tensor is produced
+                # Same barrier as YOLOv8Engine._forward and
+                # consistency.ort_forward: the tensor is produced
                 # asynchronously on the torch stream while ORT executes on its
                 # own stream and reads the DLPack buffer without waiting for
                 # the producer. Synchronize the producing stream before
@@ -495,31 +575,52 @@ class Benchmark:
 
     # driver
     def run_all(self, models: Dict[str, str]) -> pd.DataFrame:
-        """Run benchmarks for every backend and return a summary DataFrame."""
+        """Run benchmarks for every backend and return a summary DataFrame.
+
+        A backend whose run raises (an engine crash, a missing optional
+        runtime) is logged and omitted from the results — the loop
+        continues, and the closing warning names every failed backend with
+        its reason (the same omit-and-summarize contract as
+        ``OpenVINOEngine.infer``'s failed batches). The summary CSV covers
+        the backends that ran.
+        """
         results: List[Dict] = []
         summary_rows: List[List] = []
+        failed_backends: List[tuple] = []
 
         for backend, model_path in models.items():
             logger.info("===== Benchmarking %s =====", backend)
 
-            if backend == "pytorch":
-                speed = self._run_pytorch(backend, model_path)
-            else:
-                speed = self._run_onnx(backend, model_path)
+            try:
+                if backend == "pytorch":
+                    speed = self._run_pytorch(backend, model_path)
+                elif backend.startswith("openvino"):
+                    speed = self._run_openvino(backend, model_path)
+                else:
+                    speed = self._run_onnx(backend, model_path)
 
-            # mAP provenance: per-row why mAP is present, unsupported,
-            # failed, or disabled; surfaced as the `mAP_source` column in the
-            # summary CSV. A backend without a Python engine reports
-            # `unsupported`.
-            map50 = None
-            map5095 = None
-            if not self.validation:
-                map_source = "disabled (--validation off)"
-            else:
-                m, map_source = self._compute_map_native(backend, model_path)
-                if m is not None and m["mAP50"] is not None:
-                    map50 = m["mAP50"]
-                    map5095 = m["mAP50-95"]
+                # mAP provenance: per-row why mAP is present, unsupported,
+                # failed, or disabled; surfaced as the `mAP_source` column in the
+                # summary CSV. A backend without a Python engine reports
+                # `unsupported`; its precision signal is the consistency harness.
+                map50 = None
+                map5095 = None
+                if not self.validation:
+                    map_source = "disabled (--validation off)"
+                else:
+                    m, map_source = self._compute_map_native(backend, model_path)
+                    if m is not None and m["mAP50"] is not None:
+                        map50 = m["mAP50"]
+                        map5095 = m["mAP50-95"]
+            except Exception as e:
+                # Per-backend isolation: one backend's crash (engine
+                # construction, missing optional runtime, timed loop) must
+                # not discard the measurements of the other backends.
+                failed_backends.append((backend, model_path, e))
+                logger.exception(
+                    "Benchmark failed for %s (model=%s)", backend, model_path,
+                )
+                continue
 
             results.append(speed)
             summary_rows.append([
@@ -542,6 +643,13 @@ class Benchmark:
                 map5095,
                 map_source,
             ])
+
+        if failed_backends:
+            logger.warning(
+                "%d/%d backends failed and were skipped from the summary: %s",
+                len(failed_backends), len(models),
+                [(b, str(e)) for b, _, e in failed_backends],
+            )
 
         summary_df = pd.DataFrame(summary_rows, columns=[
             "Model", "Backend", "Device", "BatchSize", "Total_s", "Batch_s",

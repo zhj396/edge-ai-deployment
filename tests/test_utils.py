@@ -126,6 +126,17 @@ def test_existing_validation_rejects_unknown_suffix(tmp_path):
         existing_validation(f)
 
 
+def test_existing_validation_accepts_openvino_ir(tmp_path):
+    # OpenVINO IR comes as .xml + sibling .bin; both must validate so the
+    # `openvino run --model` path isn't rejected as an "unsupported format".
+    xml = tmp_path / "y.xml"
+    binf = tmp_path / "y.bin"
+    xml.write_text("<net/>")
+    binf.write_bytes(b"\0" * 4)
+    assert existing_validation(xml) == xml
+    assert existing_validation(binf) == binf
+
+
 def test_existing_validation_missing_artifact_path_hints_artifacts_md(tmp_path):
     """A missing path under models/ or data/ points at ARTIFACTS.md — those
     directories are git-ignored, so the usual cause is a skipped download."""
