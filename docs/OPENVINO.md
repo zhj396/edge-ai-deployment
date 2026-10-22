@@ -1,8 +1,8 @@
 # OpenVINO Deployment
 
 Intel's OpenVINO toolkit is the runtime for Intel CPUs, Intel integrated GPUs, Intel Arc GPUs, and
-(on older OpenVINO releases) Intel Movidius VPUs. This toolchain supports it as a fourth inference
-backend alongside PyTorch, ONNX FP32, and ONNX INT8.
+(on older OpenVINO releases) Intel Movidius VPUs. This toolchain supports it as an additional
+inference backend alongside PyTorch, ONNX FP32/INT8, and TensorRT.
 
 ## Why OpenVINO for Edge AI
 
