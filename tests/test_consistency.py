@@ -15,6 +15,9 @@ from utils.comparison import (
     compare_detections,
     compare_tensors,
     compute_iou,
+    REDUCED_PRECISION_MARKERS,
+    select_tolerance_pair,
+    TOLERANCE_PAIRS,
 )
 
 
@@ -112,8 +115,124 @@ def test_src_consistency_reexports_comparison_helpers():
         "compare_tensors",
         "compute_iou",
         "compare_detections",
+        "select_tolerance_pair",
+        "TOLERANCE_PAIRS",
+        "REDUCED_PRECISION_MARKERS",
     ):
         assert getattr(sc, name) is getattr(uc, name), name
+
+
+# ---------------------------------------------------------------------------
+# Tolerance auto-selection (select_tolerance_pair)
+# ---------------------------------------------------------------------------
+def test_select_tolerance_pair_strict_pt_vs_fp32_onnx():
+    """The README default pair (.pt vs *_fp32.onnx) auto-selects strict."""
+    assert select_tolerance_pair(
+        "models/yolov8s.pt", "models/yolov8s_fp32.onnx"
+    ) == ("strict", 1e-4, 1e-3)
+
+
+def test_select_tolerance_pair_strict_swapped_order():
+    """Order-independent: swapping model1/model2 cannot change the pair."""
+    a = select_tolerance_pair("models/yolov8s.pt", "models/yolov8s_fp32.onnx")
+    b = select_tolerance_pair("models/yolov8s_fp32.onnx", "models/yolov8s.pt")
+    assert a == b == ("strict", 1e-4, 1e-3)
+
+
+def test_select_tolerance_pair_strict_pth_and_plain_onnx():
+    """.pth aliases .pt (ModelWrapper's suffix branch); a marker-free .onnx
+    pairs strict — the 'full-precision unless marked' default."""
+    assert select_tolerance_pair(
+        "models/yolov8s.pth", "models/yolov8s.onnx"
+    ) == ("strict", 1e-4, 1e-3)
+
+
+def test_select_tolerance_pair_loose_int8_stem():
+    assert select_tolerance_pair(
+        "models/yolov8s.pt", "models/yolov8s_int8.onnx"
+    ) == ("loose", 1e-3, 1e-2)
+
+
+def test_select_tolerance_pair_loose_fp16_stem():
+    assert select_tolerance_pair(
+        "models/yolov8s_fp32.onnx", "models/yolov8s_fp16.onnx"
+    ) == ("loose", 1e-3, 1e-2)
+
+
+def test_select_tolerance_pair_loose_openvino_int8_prefix():
+    """The openvino_int8: prefix carries the int8 marker (plus a .xml
+    suffix, which the allowlist rejects independently)."""
+    assert select_tolerance_pair(
+        "openvino_int8:models/yolov8s_openvino_int8.xml", "models/yolov8s.pt"
+    ) == ("loose", 1e-3, 1e-2)
+
+
+def test_select_tolerance_pair_loose_plain_openvino_prefix():
+    """A plain openvino: IR is never strict: convert defaults to FP16, so
+    .xml is not in the full-precision suffix allowlist."""
+    assert select_tolerance_pair(
+        "openvino:models/yolov8s_openvino.xml", "models/yolov8s.pt"
+    ) == ("loose", 1e-3, 1e-2)
+
+
+def test_select_tolerance_pair_prefix_stripping_ort_cpp():
+    """ort_cpp: is a transparent backend selector — the stripped .onnx stem
+    classifies as before."""
+    assert select_tolerance_pair(
+        "ort_cpp:models/yolov8s_fp32.onnx", "models/yolov8s.pt"
+    ) == ("strict", 1e-4, 1e-3)
+
+
+def test_select_tolerance_pair_loose_tensorrt_engine():
+    """.engine is not in the full-precision allowlist (and the fp16 stem
+    marker would trip regardless)."""
+    assert select_tolerance_pair(
+        "tensorrt:models/yolov8s_fp16.engine", "models/yolov8s_fp32.onnx"
+    ) == ("loose", 1e-3, 1e-2)
+
+
+def test_select_tolerance_pair_marker_and_prefix_tuples_pinned():
+    """The classification vocabulary is a pinned contract: adding a marker
+    (e.g. 'int8' -> also 'int16'?) or dropping a suffix changes verdicts on
+    existing model pairs — do it deliberately, here."""
+    assert TOLERANCE_PAIRS == {"strict": (1e-4, 1e-3), "loose": (1e-3, 1e-2)}
+    assert REDUCED_PRECISION_MARKERS == (
+        "int8", "int4", "fp16", "f16", "half", "quant",
+    )
+
+
+def test_consistency_parser_tolerance_defaults_are_none():
+    """--atol/--rtol default to None (deferred to the auto-selector in
+    run()); an explicit flag overrides its half only."""
+    pytest.importorskip("ultralytics")
+    import argparse
+
+    from cli.consistency import add_parser
+
+    parser = argparse.ArgumentParser()
+    add_parser(parser.add_subparsers(dest="command"))
+
+    args = parser.parse_args(["consistency"])
+    assert args.atol is None and args.rtol is None
+
+    args = parser.parse_args(["consistency", "--atol", "1e-4"])
+    assert args.atol == 1e-4 and args.rtol is None
+
+    args = parser.parse_args(["consistency", "--rtol", "1e-2"])
+    assert args.atol is None and args.rtol == 1e-2
+
+
+def test_consistency_report_records_tolerances():
+    """validate_consistency records the resolved pair (and its source, when
+    the CLI passes one) under ``tolerances`` in the final report."""
+    pytest.importorskip("ultralytics")
+    import inspect
+
+    from src import consistency
+
+    src = inspect.getsource(consistency.validate_consistency)
+    assert '"tolerances"' in src
+    assert "tolerance_source" in src
 
 
 def test_pure_python_tests_dont_pull_ultralytics():
