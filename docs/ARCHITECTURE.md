@@ -716,6 +716,54 @@ class match 1.0) and 1 score-diff-gated failure (0.177); advisory cosine 0.9986 
 > faster on an FP32 denominator affected by the CPU-EP fallback (note 1), with an mAP50-95 drop of
 > 0.0054 (0.402 → 0.396). Detection-mode consistency is judged by the §7 gates.
 
+### 11.1 TensorRT (recorded on a Kaggle Tesla T4)
+
+> Environment: Kaggle Tesla T4 (sm_75), `tensorrt==10.16.1.11` + cuda-python (CUDA-12.x), Python
+> 3.13, imgsz 640, batch 1, the `--static` Turing route (six engines built: FP32/FP16/INT8-QDQ/
+> INT8-calib+OBEY/INT8-wholenet/INT8-Entropy-64). Consistency runs use the same 16 seed-42-sampler
+> images as the CPU rows; the FP32-TRT baseline pins strict (1e-4/1e-3) explicitly (the `.engine`
+> suffix routes the auto-selector loose). Run artifacts are archived locally, outside the repo;
+> see [docs/TENSORRT.md](TENSORRT.md) for the build/ablation structure.
+
+**Consistency** (FP32-ONNX reference vs each engine, dual verdict):
+
+| pair | raw `fail_rate` | conf-cliff `detection_fail_rate` | signature |
+|---|---|---|---|
+| FP32-ONNX ↔ TRT FP32 (strict, explicit) | 0% | 0% | plumbing baseline — clean |
+| FP32-ONNX ↔ TRT FP16 (auto-loose) | 100% | **0%** | `max_diff` 3.7–12.9 (box-tail FP16 mantissa), cos ≥ 0.999999, `above_cliff X→X` on all 16 — benign |
+| FP32-ONNX ↔ TRT INT8 **QDQ** | 100% | **0%** | `max_diff` up to 510.5, cos 0.994–0.998 — symmetric-backbone divergence absorbed by the cliff; per-image IoU/score gates (detection mode): 25.00% |
+| FP32-ONNX ↔ TRT INT8 **calib+OBEY** | 100% | **43.75%** | six of the seven cliff-flip images are whole-net's set — OBEY is a no-op under calibrator-based implicit quantization; per-image gates 68.75% |
+| FP32-ONNX ↔ TRT INT8 **whole-net** | 100% | **37.50%** | `max_diff` up to 547.8, three catastrophic flips (`8→0`, `12→0`, `39→0`); per-image gates 68.75% |
+| FP32-ONNX ↔ TRT INT8 **Entropy-64** | 100% | 25.00% | flips threshold-edge only (`12→3`, `39→31` — none collapse to 0); per-image gates 25.00%, class match 1.000 everywhere |
+
+The three-point structure — QDQ (cliff 0%) ≪ calib+OBEY ≈ whole-net (cliff 37.50–43.75%, flip
+sets overlapping by six images) — is the measured form of the head-protection mechanism gap:
+only the graph-level absence of Q/DQ nodes keeps the head FP32 end-to-end; per-layer precision
+constraints do not bind at tactic selection under calibrator-based implicit quantization (the
+engine inspector on 10.16.1 carries no per-layer precision field, so the conf-cliff gate is the
+arbiter — see [docs/TENSORRT.md](TENSORRT.md)). The FP32-TRT baseline also cross-checks against
+the graph level: `diag_qdq_head.py` counts 393 Q/DQ nodes on the quantized graph, **zero**
+under `/model.22/`.
+
+**Benchmark** (batch 1; latency columns on the 16-image speed set at the canonical
+protocol — `--warmup 10 --runs 25` (the CLI defaults); mAP columns on the full
+397-image val split, native evaluator):
+
+| backend | FPS | p50 (ms) | Kernel_latency_ms | Kernel_fps | mAP50 | mAP50-95 |
+|---|---|---|---|---|---|---|
+| onnx_fp32 (CPU EP) | 5.58 | 2498 | — | — | 0.590 | 0.402 |
+| tensorrt (FP32 engine) | 68.36 | 202 | 0.0077 | 130k | 0.590 | 0.402 |
+| tensorrt_fp16 | 79.71 | 174 | 0.0078 | 128k | 0.591 | 0.403 |
+| tensorrt_int8 | 80.59 | 172 | 0.0082 | 122k | 0.593 | 0.395 |
+
+The FP32-TRT row matches the ONNX-FP32 row **per class** on both mAP metrics (11/12 classes
+identical, chair within 2e-7) — a second, metric-surface-independent confirmation of the FP32
+engine's fidelity, complementing the strict consistency baseline. e2e sits on the host (NMS /
+letterbox / I/O): the GPU forward is ~0.008 ms against a 172–202 ms sweep — FP16 gains ~17%
+e2e while FP16→INT8 is flat e2e. The kernel columns' run-to-run spread on this card is
+comparable to the INT8-vs-FP16 gap, so the durable claims are model size + compute headroom
+for INT8 and a host-dominated e2e.
+
 ---
 
 ## 12. Operating instructions
