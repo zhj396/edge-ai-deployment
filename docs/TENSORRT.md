@@ -59,21 +59,19 @@ distribution matches the deployed path.
 > from a TRT-friendly ONNX (`opset 13`, `simplify=False`). The project's
 > canonical `yolov8s_fp32.onnx` (`opset 17` + `onnxsim`) carries a simplified
 > dynamic `Shape`+`Slice` subgraph — one trigger of the limit. On the
-> validated Turing T4 (sm_75, TRT 10.x) the dynamic-batch build verdict is
-> `_TBD_` pending the recorded run (see [Provenance](#provenance)); the
-> author's T4 session produced a tactic-selection failure with the
-> paraphrased signature `nbDims > Dims::MAX_DIMS — Could not find any
-> implementation for node ONNXTRT_ShapeSlice_*` (node numbers elided). The
-> suspected cause is the dynamic batch dim itself: the DFL reshape
+> validated Turing T4 (sm_75, TRT 10.x) the dynamic-batch build fails at
+> tactic selection; the paraphrased failure-log signature is
+> `nbDims > Dims::MAX_DIMS — Could not find any implementation for node
+> ONNXTRT_ShapeSlice_*` (node numbers elided). The cause is the dynamic
+> batch dim itself: the DFL reshape
 > `[-1,4,16,8400]` over a symbolic batch forces TRT to materialize a
-> `Shape`+`Slice` subgraph it apparently cannot lower on Turing — this is
-> inferred from the log, not documented by NVIDIA, and no recorded log is
-> committed (see [Provenance](#provenance): all measured figures are
-> `_TBD_`). The Turing route is **`--static`**: it exports a static-batch=1
+> `Shape`+`Slice` subgraph it cannot lower on Turing — inferred from the
+> failure log, not documented by NVIDIA. The Turing route is
+> **`--static`**: it exports a static-batch=1
 > ONNX (a concrete batch dim keeps the subgraph out of the graph) and builds
 > a batch=1 engine (no optimization profile). On Ampere+ (sm_80+) the dynamic
-> route is the expected default — whether it builds clean on a given card is
-> what the recorded runs fill in (see [Provenance](#provenance)). The canonical
+> route is the expected default; its build verdict has no recorded run on
+> the pinned environment (see [Provenance](#provenance)). The canonical
 > ONNX stays canonical for ORT/OpenVINO. Passing `--model X.pt` auto-exports the
 > TRT-friendly ONNX to `models/yolov8s_trt.onnx`; a `--static` build exports to
 > `models/yolov8s_trt_static.onnx`, so the two cached exports never collide
@@ -102,31 +100,35 @@ The TRT INT8 build keeps the `/model.22/` Detect head in FP32 (the Path-A mirror
 the ORT INT8 path's head exclusion). Quantizing the head to INT8 breaks the head's
 unbounded box-decode accumulation.
 
-> **Provenance.** Measured figures in this document are recorded as `_TBD_`
-> until a full run on the pinned environment (Kaggle Tesla T4, current
-> `tensorrt==10.16.1.11` pin, `--static` Turing route) fills them with its own
-> recorded logs — date, host, device, versions, image count, imgsz/batch per
-> the repo's reproducibility rules. The durable content is the mechanism
-> structure and why each lever exists (INT8 on the head's unbounded
-> box-decode accumulation; the calibrator path's precision constraints that
-> may not bind at tactic selection; the coarser symmetric activation
-> quantization the TRT-bound QDQ requires) — which builds fail and which
-> survive is what the recorded runs fill in.
+> **Provenance.** Measured figures below come from a full recorded run on the pinned
+> environment: Kaggle Tesla T4 (sm_75), `tensorrt==10.16.1.11` / cuda-python
+> (CUDA-12.x), Python 3.13, imgsz 640, batch 1, the `--static` Turing route.
+> Consistency runs: the default `--max-images 20` budget → 16 seed-42-sampler images
+> (12-class stratified quotas) — the same set the recorded OpenVINO
+> (`docs/OPENVINO.md`) and ORT-C++ (`docs/ORT_CPP.md`) runs used; the FP32-TRT
+> baseline pins strict (1e-4/1e-3) explicitly because the `.engine` suffix routes the
+> auto-selector loose. **Run artifacts, archived locally outside the repo**: per-step
+> logs (`01`–`06_*.log`), the 10 consistency JSON reports (05a/05b ran tensor mode
+> only), the benchmark summary + per-class CSVs (`benchmark_summary_<TS>.csv` +
+> `*_perclass_*.csv`), the engine-inspector dump, `env.txt` (versions + `nvidia-smi`),
+> and `app.log` with the full per-image lines. The mechanism structure — why each lever
+> exists and which builds fail/survive — matches the figures.
 
-The consistency-run structure (the detection fail share is the share of
-images whose detection-level verdict flipped — recorded per image by the
-consistency harness):
+The consistency-run structure (the detection fail share is the share of images whose
+detection-level verdict flipped — recorded per image by the consistency harness; all
+six builds ran the same 16-image set):
 
 | build | `max_diff` (box coords, 0–640) | tensor `fail_rate` | detection fail share |
 |---|---|---|---|
-| INT8 **whole-net** (`--calibrator --no-exclude-head`) | `_TBD_` (large — head box-decode quantized) | `_TBD_` | `_TBD_` |
-| INT8 **calibrator + OBEY** (`--calibrator`) | `_TBD_` | `_TBD_` | `_TBD_` |
-| INT8 **QDQ** (default — head FP32 by QDQ omission) | `_TBD_` (small — head untouched) | `_TBD_` | `_TBD_` (symmetric-backbone divergence, see the conf-cliff discussion under Consistency) |
-| FP32 TRT vs FP32 ONNX (plumbing baseline) | `_TBD_` (near zero) | `_TBD_` | `_TBD_` |
+| INT8 **whole-net** (`--calibrator --no-exclude-head`) | 240.3–547.8 | 100% | **37.50%** (6/16; three catastrophic — `8→0`, `12→0`, `39→0`) |
+| INT8 **calibrator + OBEY** (`--calibrator`) | 250.8–568.0 | 100% | **43.75%** (7/16 — six of the seven are whole-net's flip set: OBEY is a no-op under calibrator-based implicit quantization, up to one borderline image) |
+| INT8 **QDQ** (default — head FP32 by QDQ omission) | 261.3–510.5 | 100% | **0%** on the conf-cliff gate (16/16 `CONSISTENT (cliff clean)`; per-image IoU/score gates in detection mode: 25.00% — the symmetric-backbone cost, see the conf-cliff discussion under Consistency) |
+| FP32 TRT vs FP32 ONNX (plumbing baseline) | strict allclose, 0 failures | 0% | **0%** |
 
-FP16-whole-net is expected to keep detections consistent (FP16 has the exponent
-range INT8 lacks; `max_diff` `_TBD_` until a recorded run), so head FP32
-protection is gated on `int8` — FP16/FP32 builds skip it.
+FP16-whole-net keeps detections consistent (`max_diff` 3.7–12.9 on the same
+run, cosine ≥ 0.999999, `detection_fail_rate=0%` — FP16 has the exponent
+range INT8 lacks), so head FP32 protection is gated on `int8` — FP16/FP32
+builds skip it.
 
 **Mechanism — explicit QDQ (default); calibrator+OBEY is the ablation.** The
 default INT8 build feeds TRT an **explicit-quantization QDQ ONNX** produced
@@ -156,15 +158,22 @@ on the parsed `INetworkDefinition` (the `/model.22/` layer set pinned) pins
 the head FP32 only where the constraints bind at tactic selection — under
 calibrator-based implicit quantization they may not bind, and the head then
 runs INT8 with the whole-net detection-consistency cost the calibration run
-measures (pinned-environment result: `_TBD_` — see Provenance).
+measures (pinned-environment result: `detection_fail_rate` **43.75%** vs
+whole-net's **37.50%** — six of the seven cliff-flip images are shared with
+the whole-net build, at the same max_diff band; per-image IoU/score gates
+68.75% both. Pinning 70 head layers and excluding nothing yield (up to one
+borderline image) the same failure mode on the same images — per-layer
+precision is a no-op under calibrator-based implicit quantization).
 `OBEY_PRECISION_CONSTRAINTS` is set; whether the builder honors it for the
 calibrator path is build-dependent. On the TRT builds whose engine inspector
 dump carries only layer *names* (`{"Layers":[...],"Bindings":[...]}`, no
-per-layer precision field — `scripts/diag_trt_head.py` tallies per-layer
-precision when a build's dump exposes it), runtime precision can't be
-confirmed via the inspector — the conf-cliff gate is the ground truth. The
-default QDQ path is explicit quantization: TRT reads the scales from the
-graph, with no calibrator in the loop.
+per-layer precision field — verified on the pinned 10.16.1 build: 145
+parsed layers / 61 head layers, zero precision tokens —
+`scripts/diag_trt_head.py` tallies per-layer precision when a build's dump
+exposes it), runtime precision can't be confirmed via the inspector — the
+conf-cliff gate is the ground truth. The default QDQ path is explicit
+quantization: TRT reads the scales from the graph, with no calibrator in
+the loop.
 
 ```bash
 # Default INT8 = QDQ path (head FP32 by QDQ omission, no calibrator)
@@ -222,36 +231,49 @@ python main.py tensorrt build --static --precision int8 \
     --model models/yolov8s.pt --output models/yolov8s_int8_ent.engine \
     --calib-method Entropy --max-cal-samples 64
 # then consistency vs the opset-13 FP32:
-python main.py consistency --model1 tensorrt:models/yolov8s_int8_ent.engine \
-    --model2 models/yolov8s_trt.onnx --max-images 12 --batch-sizes 1
+python main.py consistency --model1 models/yolov8s_fp32.onnx \
+    --model2 tensorrt:models/yolov8s_int8_ent.engine --mode tensor --device 0
 ```
 
-**Measured (T4, Entropy vs MinMax):** `_TBD_` — pending a recorded run on the
-pinned environment (device, sample count, consistency-set size, versions, and
-raw logs per the reproducibility rules). Configuration guidance: **MinMax is
-the default; Entropy is the lever if shipping INT8 anyway; FP16 is the default
-T4 build precision (its detection-consistency figure is `_TBD_` until a
-recorded run).** Failure mode: `_TBD_` (expected demotion-heavy, i.e. recall
-loss).
+**Measured (T4, Entropy-64 vs MinMax-300, same 16-image set):**
+Entropy-64 — `detection_fail_rate` 25.00% (4/16 cliff flips, none
+catastrophic: the worst is `12→3` and `39→31`, versus the calibrator builds'
+`8→0`/`39→0`), per-image IoU/score gates 25.00% (4/16, all count/score
+edge failures — one at IoU 1.0000 with count+2; class match 1.000 everywhere,
+no full-mismatch images), cosine 0.993–0.999.
+MinMax-300 (the 5c QDQ row) — cliff gate 0%, per-image IoU/score gates
+25.00% (4/16, including an IoU-0.81 box-shift failure). Reading:
+Entropy's cliff rate is nominally worse on n=16 but its flips are an order
+of magnitude lighter (threshold-edge partial loss vs whole-detection
+collapse), and the release-relevant per-image gate lands at the same rate
+with lighter failure forms (count/score edges vs box shifts).
+Configuration guidance: **MinMax is the default; Entropy is the lever if
+shipping INT8 anyway; FP16 is the default T4 build precision (its
+detection-consistency figure: `detection_fail_rate=0%` on the recorded
+run).** Failure mode: demotion-heavy (recall loss), bounded by the
+Entropy fit — flips stay at the threshold edge; the image's above-cliff set
+does not collapse.
 The **conf-cliff gate** (Consistency section below) checks
 *detection consistency*; the head-FP32 question is a separate check — the two
 questions are distinct. The head-FP32 check is the pure ONNX diagnostic
-`scripts/diag_qdq_head.py models/yolov8s_trt_int8.onnx` (counts Q/DQ nodes under
+`scripts/diag_qdq_head.py models/yolov8s_trt_static_int8.onnx
+models/yolov8s_trt_static.onnx` (counts Q/DQ nodes under
 `/model.22/`; pure `onnx`, no TRT/GPU): head Q/DQ=0 ⟹ the head stayed FP32 by
-QDQ omission. On the **default QDQ path** that holds by construction (the
-head is outside the quantization scope; the `diag_qdq_head.py` head-Q/DQ
-count on the pinned build is `_TBD_`) — yet the detection fail share can still
-be nonzero, because the TRT-bound QDQ forces
+QDQ omission. On the **default QDQ path** that holds by construction and on
+the pinned build (654 nodes, 393 Q/DQ — all in the backbone — 90 head nodes,
+**zero head Q/DQ**; the FP32 reference export: 261 nodes, 0 Q/DQ, the same
+90 head nodes) — yet the per-image IoU/score gates can still fail
+(25.00% on the recorded run), because the TRT-bound QDQ forces
 **symmetric activation quantization**, whose coarser activation scales let
-backbone error propagate into the FP32 head's box-decode and flip the cliff on
-a share of images (cosine stays high; a collapse is the signature that tanks
-cosine). So: a nonzero detection fail share on a QDQ-path run points to
-symmetric-backbone INT8 divergence; the head staying FP32 is verified by the
-diagnostic above. The calibrator path is expected to fail with a much larger
-`max_diff` alongside lower cosine; magnitude + cosine distinguish the two
+backbone error propagate into the FP32 head's box-decode and shift boxes /
+drift scores past the strictest gates (cosine stays 0.994–0.998; a collapse
+is the signature that tanks cosine). So: a nonzero per-image gate failure on
+a QDQ-path run points to symmetric-backbone INT8 divergence; the head
+staying FP32 is verified by the diagnostic above. The calibrator path fails
+with a much larger `max_diff` alongside cliff flips and lower per-image
+detection quality; magnitude + the gate verdicts distinguish the
 classes. A zero detection fail share ⟹ head FP32 **and** backbone divergence
-under the cliff (the FP16-whole-net case). The per-configuration fail shares
-and the failure signatures are `_TBD_` until a recorded run (see Provenance).
+under the cliff (the FP16-whole-net case).
 
 ## Run inference
 
@@ -289,26 +311,32 @@ For reduced-precision pairs (FP16/INT8) the consistency CLI auto-selects
 the loose pair (`atol 1e-3`, `rtol 1e-2`) from the model-pair stems, sized
 for reduced-precision numerical noise — the explicit flags in the command
 above pin the same pair. At FP16 precision raw box coords are not expected
-to pass strict allclose at any safe tolerance (the recorded divergence is
-`_TBD_` until a run on the pinned environment); the **conf-cliff gate**
+to pass strict allclose at any safe tolerance (recorded on the pinned
+environment: `max_diff` 3.7–12.9 on a 0–640 scale across the 16-image
+set — FP16's ~3-digit mantissa on the head's unbounded box-decode
+accumulation);
+the **conf-cliff gate**
 (`utils/comparison.compare_tensors`, wired to the deployed conf threshold
 in `src/consistency.py`) stays the authoritative gate for spurious-detection
-count increases.
+count increases. Note the device flag's semantics on a `tensorrt:` pair: a
+numeric id (`--device 0`) selects the TRT engine's GPU while the reference
+model, sampler, and preprocessing run on CPU — `cuda` is the setting that
+puts the reference model on GPU.
 
 **Dual verdict (raw-tensor vs detection-level).** Because FP16 raw allclose
-is not expected to pass at any safe tolerance (recorded divergence `_TBD_`),
-`compare_tensors` reports the two tensor-mode verdicts as separate fields:
-`allclose_passed` (raw-tensor parity, the strict gate) and
-`detection_consistent` (the conf-cliff gate). `src/consistency.py` surfaces
-both per failing batch (`--batch-sizes 1` degenerates to per image) —
-`detection: CONSISTENT (cliff clean)` on a benign FP16/INT8 drift,
-`detection: INCONSISTENT (cliff flip)` on the FP32-CUDA cliff-flip class.
-The per-batch entries in `detailed_results` carry the two verdict fields
-(`allclose_passed` / `detection_consistent`); the per-config summary
-aggregates them into two fail rates (`fail_rate` / `detection_fail_rate`,
-plus `detection_failures`) and the `*_mean` statistic fields. The per-batch
-log line format (the `fail_rate` line is the per-config summary, logged once
-after the config's batches complete):
+is not expected to pass at any safe tolerance (recorded divergence: the
+`max_diff` 3.7–12.9 band above), `compare_tensors` reports the two
+tensor-mode verdicts as separate fields: `allclose_passed` (raw-tensor
+parity, the strict gate) and `detection_consistent` (the conf-cliff gate).
+`src/consistency.py` surfaces both per failing batch (`--batch-sizes 1`
+degenerates to per image) — `detection: CONSISTENT (cliff clean)` on a
+benign FP16/INT8 drift, `detection: INCONSISTENT (cliff flip)` on the
+FP32-CUDA cliff-flip class. The per-batch entries in `detailed_results`
+carry the two verdict fields (`allclose_passed` / `detection_consistent`);
+the per-config summary aggregates them into two fail rates (`fail_rate` /
+`detection_fail_rate`, plus `detection_failures`) and the `*_mean`
+statistic fields. The per-batch log line format (the `fail_rate` line is
+the per-config summary, logged once after the config's batches complete):
 
 ```
 Inconsistent | max_diff=<max_diff> | cos=<cos> | cls_max_diff=<cls_max_diff> | above_cliff <n>→<n> (promoted=<p>, demoted=<d>) | detection: CONSISTENT (cliff clean)
@@ -322,7 +350,22 @@ fail_rate=<f>% | detection_fail_rate=<d>%
 
 i.e. raw tensors diverge (allclose-FAIL) **and** detections are consistent
 (detection-PASS) — neither masks the other, so the raw divergence does not
-have to be tuned away to read the detection verdict.
+have to be tuned away to read the detection verdict. On the recorded run
+this printed `fail_rate=100.00% | detection_fail_rate=0.00%` on all 16
+images for the FP16 engine (`above_cliff X→X, promoted=0, demoted=0` per
+image).
+
+**Reading the two `detection_fail_rate` fields.** The field's semantics are
+mode-dependent (the conf-cliff gate is tensor-mode only —
+`src/consistency.py` notes this): in tensor mode it is the share of images
+that flipped the conf-cliff gate; in detection mode the log line's
+`detection_fail_rate` is always 0 and the per-image IoU/class/score gate
+results live in `fail_rate` plus the report's `per_image_detection` /
+`det_*` fields. On the recorded run the INT8-QDQ pair read: tensor mode
+`fail_rate=100% | detection_fail_rate=0%`, detection mode
+`fail_rate=25.00%` (4/16 IoU/score-gate failures, class match 1.000
+everywhere). Three numbers — raw allclose, conf-cliff, per-image gates —
+answer three different questions; read them pairwise, never collapsed.
 
 ## Benchmark (`python main.py benchmark`)
 
@@ -357,6 +400,36 @@ evaluator** (`utils/map_eval.evaluate_map` driving the engine's own `infer()`)
 carries no Ultralytics metadata for `YOLO().val()` to key on, so the rows
 carry mAP50 / mAP50-95 on the same metric as every other Python-driven
 backend (the NNCF-INT8 vs QDQ-INT8 mAP delta is visible).
+
+**Recorded run (batch 1; latency columns on the 16-image speed set at the canonical
+protocol — `--warmup 10 --runs 25` (the CLI defaults); mAP columns on the full
+397-image val split via `--validation`):**
+
+| backend | FPS | p50 (ms) | Kernel_latency_ms | Kernel_fps | mAP50 | mAP50-95 |
+|---|---|---|---|---|---|---|
+| `onnx_fp32` (CPU EP) | 5.58 | 2498 | — | — | 0.590 | 0.402 |
+| `tensorrt` (FP32 engine) | 68.36 | 202 | 0.0077 | 130k | 0.590 | 0.402 |
+| `tensorrt_fp16` | 79.71 | 174 | 0.0078 | 128k | 0.591 | 0.403 |
+| `tensorrt_int8` | 80.59 | 172 | 0.0082 | 122k | 0.593 | 0.395 |
+
+Reading the table: the FP32 TRT row's mAP matches the ONNX FP32 row
+**per class** — 11 of 12 classes identical on both metrics, chair
+within 2e-7 — a second, metric-surface-independent confirmation of the
+FP32 engine's numerical fidelity (the first is the strict consistency
+baseline). FP16's mAP delta (+0.001 / +0.001) is the mAP-surface payoff
+of its benign dual verdict; INT8-QDQ's (+0.003 / −0.007 on mAP50-95) sits
+at the level the per-image gate cost the consistency run measured. The
+end-to-end columns sit almost entirely on the host: the GPU forward is
+~0.008 ms against a 172–202 ms sweep, so e2e FPS reflects NMS / letterbox
+/ I/O — FP16 gains ~17% e2e over the FP32 engine, while FP16→INT8 is flat
+e2e. The kernel columns' run-to-run spread on this card is comparable to
+the INT8-vs-FP16 gap, so the durable T4 statements are: INT8 wins model
+size and compute headroom, the host pipeline dominates e2e at this scale,
+and only the kernel columns can see GPU-side differences at all. (The
+`onnx_fp32` row runs on the CPU execution provider — the default
+`--device` — so its timing is indicative against the GPU rows; its
+per-image detection counts agree with the FP32-TRT row on 396 of 397
+images, the remaining image by a single detection.)
 
 ## Architecture notes
 
