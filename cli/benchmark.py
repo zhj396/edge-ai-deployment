@@ -107,6 +107,11 @@ def run(args):
         # (existence-validated via existing_validation).
         model_dict["onnx_fp32"] = str(existing_validation(DEFAULT_MODEL_FP32))
 
+    # One timestamp per run, shared across the summary CSV + every
+    # <backend>_perclass.csv so a single glob matches one run's artifacts.
+    # Format rationale lives on cli.run_timestamp — the single source.
+    ts = run_timestamp()
+
     cfg = BenchmarkConfig(
         model=model_dict,
         imgs_input=(args.imgs_input if args.imgs_input is not None
@@ -124,6 +129,7 @@ def run(args):
         warmup=args.warmup,
         runs=args.runs,
         use_sampler=not args.no_sampler,
+        timestamp_suffix=ts,
     )
 
     benchmark = Benchmark(
@@ -141,9 +147,10 @@ def run(args):
         warmup=cfg.warmup,
         runs=cfg.runs,
         use_sampler=cfg.use_sampler,
-        timestamp_suffix=run_timestamp(),
+        timestamp_suffix=cfg.timestamp_suffix,
     )
 
     logger.info("========== Starting Benchmark ==========")
     summary = benchmark.run_all(cfg.model)
     logger.info("Benchmark complete: %d backends", len(summary))
+    logger.info("Benchmark summary: %s", benchmark.summary_csv_path)

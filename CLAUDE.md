@@ -485,9 +485,9 @@ layout with `N` slightly above `4+nc` (e.g. `N=8`, `4+nc=7`) to avoid
 ambiguity in the output-layout heuristic.
 
 `tests/test_consistency.py::test_pure_python_tests_dont_pull_ultralytics`
-ensures that the three pure-Python test modules (`test_consistency`,
-`test_quantize`, `test_utils`) do not pull the heavyweight `ultralytics`
-dependency at import time.
+ensures that the four pure-Python test modules (`test_consistency`,
+`test_quantize`, `test_utils`, `test_map_eval`) do not pull the heavyweight
+`ultralytics` dependency at import time.
 
 Tests that require a model or GPU should remain opt-in rather than being
 part of the default test gate.

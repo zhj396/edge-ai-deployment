@@ -120,7 +120,7 @@ def test_pure_python_tests_dont_pull_ultralytics():
     """Importing the pure-Python test modules must not import ultralytics.
 
     The comparison helpers live in utils.comparison (pure NumPy). Within
-    these three modules the only ultralytics pull would come transitively
+    these four modules the only ultralytics pull would come transitively
     through src imports (e.g. src.postprocess, which needs
     non_max_suppression + scale_boxes) — the modules themselves must stay
     ultralytics-free.
@@ -136,6 +136,7 @@ def test_pure_python_tests_dont_pull_ultralytics():
     import test_consistency   # noqa: F401
     import test_quantize      # noqa: F401
     import test_utils         # noqa: F401
+    import test_map_eval      # noqa: F401  (utils.map_eval — pure-NumPy mAP)
 
     assert "ultralytics" not in sys.modules, (
         "pure-Python test modules must not import ultralytics; "

@@ -567,7 +567,8 @@ iou=0.7 — the COCO-standard PR-curve config from `--conf-threshold` / `--iou-t
 benchmark backend with a Python engine — including raw OpenVINO IRs — goes through the same
 evaluator, so mAP50 / mAP50-95 are
 directly comparable across backends. CLI runs write the per-class rows to
-`results/<backend>_perclass<timestamp>.csv`; the summary CSV records three columns: `mAP50`,
+`results/<backend>_perclass_<TS>.csv` (library callers that omit the timestamp suffix get the
+unsuffixed `<backend>_perclass.csv`); the summary CSV records three columns: `mAP50`,
 `mAP50-95`, and `mAP_source`.
 
 **mAP provenance (`mAP_source`).** Each summary row records *why* its mAP is present or absent:
@@ -629,11 +630,13 @@ Three principles:
 
 1. **Tests must run on a laptop, without a model or GPU.** Heavier feature modules
    (`src/consistency.py`, `src/quantize.py`) are imported inside test functions, and
-   `test_pure_python_tests_dont_pull_ultralytics` enforces that the three pure-Python test modules
-   (`test_consistency`, `test_quantize`, `test_utils`) don't pull `ultralytics` at import time.
-   Two test modules bind heavy dependencies at module level: `test_postprocess` (because
-   `src/postprocess` needs Ultralytics NMS) and `test_benchmark_map_plumbing` (because
-   `src.benchmark` imports torch / onnxruntime / pandas / psutil / ultralytics).
+   `test_pure_python_tests_dont_pull_ultralytics` enforces that the four pure-Python test modules
+   (`test_consistency`, `test_quantize`, `test_utils`, `test_map_eval`) don't pull `ultralytics`
+   at import time.
+   Several test modules bind heavy dependencies at module level: `test_postprocess` (because
+   `src.postprocess` needs Ultralytics NMS), `test_benchmark_map_plumbing` (because
+   `src.benchmark` imports torch / onnxruntime / pandas / psutil / ultralytics), and
+   `test_consistency_ort_forward` (module-level `import torch`).
    `test_postprocess.py` builds a synthetic `(bs=1, 4+nc=7, N≥8)` prediction and exercises the full
    path.
 2. **No mocking.** The functions are written to be unit-testable without mocks — `post_process`
@@ -651,7 +654,7 @@ Three principles:
 > **CPU rows measured 2026-10-15** (WSL2 Ubuntu on the i5-13420H laptop; Python 3.12.3, torch
 > 2.6.0+cpu — the FP32 export and INT8 model were produced under it — onnxruntime 1.26.0,
 > ultralytics 8.4.114): speed loop = 14 sampler-selected val images (budget 16), batch 1, warmup 10,
-> runs 25; latency = per-run wallclock over the speed set (`results/benchmark_summary<timestamp>.csv`);
+> runs 25; latency = per-run wallclock over the speed set (`results/benchmark_summary_<TS>.csv`);
 > mAP = full 397-image val split; calibration = 243/397 val images (budget 300, seed 42).
 > **CUDA rows measured 2026-10-16** on Kaggle Tesla T4 (run `20261016_030921_424`;
 > Python 3.12.13, torch 2.10.0+cu128 — the image's preinstalled CUDA build, recorded in
@@ -693,7 +696,7 @@ Three principles:
    loop uses `session.run`, so the latency / FPS / RSS columns are unaffected; the ONNX-CUDA mAP
    columns (³) measure 0.590 / 0.402 (FP32) and 0.589 / 0.396 (INT8).
 
-mAP columns are per-class means (`results/<backend>_perclass<timestamp>.csv` on CLI runs). The PT
+mAP columns are per-class means (`results/<backend>_perclass_<TS>.csv` on CLI runs). The PT
 and ONNX FP32 rows agree per class (0.590 / 0.402), and PT↔FP32 passes the strict tensor gate, so
 the FP32 export reproduces the PT model. The values sit below the training-side record
 (0.601 / 0.411, [TRAINING.md §6](TRAINING.md#6-results)); the offset is consistent with the
