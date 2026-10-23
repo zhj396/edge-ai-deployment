@@ -285,13 +285,15 @@ python main.py consistency \
     --model2 tensorrt:models/yolov8s_int8.engine --mode detection
 ```
 
-The consistency CLI defaults to the loose pair (`--atol 1e-3`, `--rtol 1e-2`),
-sized for reduced-precision numerical noise. At FP16 precision raw box coords
-are not expected to pass strict allclose at any safe tolerance (the recorded
-divergence is `_TBD_` until a run on the pinned environment); the
-**conf-cliff gate** (`utils/comparison.compare_tensors`, wired to the
-deployed conf threshold in `src/consistency.py`) stays the authoritative
-gate for spurious-detection count increases.
+For reduced-precision pairs (FP16/INT8) the consistency CLI auto-selects
+the loose pair (`atol 1e-3`, `rtol 1e-2`) from the model-pair stems, sized
+for reduced-precision numerical noise — the explicit flags in the command
+above pin the same pair. At FP16 precision raw box coords are not expected
+to pass strict allclose at any safe tolerance (the recorded divergence is
+`_TBD_` until a run on the pinned environment); the **conf-cliff gate**
+(`utils/comparison.compare_tensors`, wired to the deployed conf threshold
+in `src/consistency.py`) stays the authoritative gate for spurious-detection
+count increases.
 
 **Dual verdict (raw-tensor vs detection-level).** Because FP16 raw allclose
 is not expected to pass at any safe tolerance (recorded divergence `_TBD_`),
