@@ -764,6 +764,47 @@ e2e while FP16→INT8 is flat e2e. The kernel columns' run-to-run spread on this
 comparable to the INT8-vs-FP16 gap, so the durable claims are model size + compute headroom
 for INT8 and a host-dominated e2e.
 
+### 11.2 TensorRT C++ (`trt_cpp` — recorded on the same Kaggle Tesla T4)
+
+> Recorded on the same session family as §11.1 with its own engine build and benchmark
+> invocation (driver `scripts/kaggle_trt_cpp_session.sh`; `tensorrt==10.16.1.11`, Python 3.13).
+> The C++ backend drives the *same serialized `.engine`* in-process through a forward-only
+> pybind11 module — preprocess / postprocess stay on the shared Python core — so the comparison
+> below is a same-engine, different-driver pair. Consistency runs vs the canonical FP32-ONNX
+> reference on the 16 seed-42-sampler images; full tables in [docs/TENSORRT.md](TENSORRT.md).
+
+| pair | tensor `fail_rate` | conf-cliff `detection_fail_rate` | signature |
+|---|---|---|---|
+| FP32-ONNX ↔ trt_cpp FP32 (strict, explicit) | 0% | 0% | plumbing baseline — clean |
+| FP32-ONNX ↔ trt_cpp FP16 (auto-loose) | 100% | **0%** | `max_diff` 3.97–13.7, cos ≥ 0.999999 — the same FP16 box-tail divergence band as the Python driver |
+| FP32-ONNX ↔ trt_cpp INT8 QDQ (tensor mode) | 100% | 6.25% | `max_diff` 275.7–511.5, cos 0.9939–0.9982 — symmetric-backbone divergence, no catastrophic flips (worst promoted 6/img vs the 5/img gate) |
+| FP32-ONNX ↔ trt_cpp INT8 QDQ (detection mode) | 18.75% | — | 3/16 IoU/score-gate failures, class match 1.000 everywhere |
+
+**Benchmark** (batch 1; canonical protocol; the mAP columns come from the native-evaluator
+pass — the full six-row table incl. the `RSS_Increase_MB` / `RSS_Absolute_MB` pair is in
+[docs/TENSORRT.md](TENSORRT.md)):
+
+| backend | FPS | p50 (ms) | Kernel_latency_ms | Kernel_fps | mAP50 | mAP50-95 |
+|---|---|---|---|---|---|---|
+| tensorrt (FP32 engine) | 68.10 | 204.3 | 0.0073 | 136k | 0.5896 | 0.4016 |
+| trt_cpp (FP32 engine) | 69.08 | 200.4 | 0.0041 | 244k | 0.5896 | 0.4016 |
+| tensorrt_fp16 | 79.82 | 174.7 | 0.0081 | 123k | 0.5906 | 0.4027 |
+| trt_cpp_fp16 | 84.06 | 165.5 | 0.0043 | 235k | 0.5906 | 0.4027 |
+| tensorrt_int8 | 79.80 | 172.7 | 0.0073 | 138k | 0.5891 | 0.3938 |
+| trt_cpp_int8 | 82.68 | 166.4 | 0.0038 | 263k | 0.5891 | 0.3938 |
+
+Reading the pair: per-class mAP is bitwise identical within each backend pair (every class,
+both metrics, all three precisions) — the C++ forward returns the same engine output the Python
+driver returns. The e2e gaps (68.1 vs 69.1, 79.8 vs 84.1, 79.8 vs 82.7 FPS) sit inside the
+run-to-run spread: the sweep is host-dominated and the GPU forward is 0.0038–0.0081 ms against
+a 165–205 ms run, so the C++ backend moves the process surface (RSS, no Python tensor
+round-trip), not the FPS — the same conclusion as the ort_cpp backend. The kernel window reads
+~2× lower through the C++ timer (0.0038–0.0043 vs 0.0073–0.0081 ms); at this scale the window
+is sync-path-bound, and the card's kernel-column spread remains comparable to the gap. The
+INT8 signature — symmetric-backbone divergence with the head FP32 by QDQ omission — matches
+the Python-path QDQ pair's structure (per-image gates 18.75% here vs 25.00% there; different
+engine builds, so flip sets are not expected to coincide).
+
 ---
 
 ## 12. Operating instructions

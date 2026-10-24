@@ -458,8 +458,11 @@ Python `tensorrt:` path: native mAP (the backend-agnostic evaluator driving
 > loader env: onnxruntime-gpu's CUDA-12 libraries come from the pip `nvidia-*`
 > wheels and need `LD_LIBRARY_PATH` set), `build` (canonical FP32 ONNX + FP32/
 > FP16/INT8-QDQ engines), `trt-cpp` (tarball subset + `_trt_cpp` build),
-> `consistency`, `benchmark` (two passes; the second is the recorded one),
-> `archive`. Each stage re-derives its environment, so
+> `consistency` (four runs; the reduced-precision runs' exit-1 is tolerated —
+> raw allclose FAIL is the dual verdict's expected half — while the strict
+> FP32 baseline stays a hard gate), `benchmark` (two passes; the second is the
+> recorded one), `archive`, `clean` (reset run artifacts between sessions,
+> keeping `models/`). Each stage re-derives its environment, so
 > `bash scripts/kaggle_trt_cpp_session.sh <stage>` behaves identically from a
 > notebook cell or a fresh terminal; the per-stage commands below are the
 > canonical form the stages sequence.
@@ -511,6 +514,83 @@ Contract notes:
   wheels. It verifies (does not install) that the installed `tensorrt` wheel
   matches the tarball, so the `.engine` cross-loads (TRT engines are
   version-locked across major versions).
+
+**Recorded consistency runs** (the driver's `consistency` stage; FP32-ONNX
+reference vs `trt_cpp:`, the same 16 seed-42-sampler images as every recorded
+run; the FP32 row pins strict explicitly — the `.engine` suffix routes the
+auto-selector loose; the FP16/INT8 runs' raw-tensor allclose FAIL is the
+expected dual-verdict half, so the driver tolerates their exit-1 and the
+verdict is read from the report JSON):
+
+| pair | tensor `fail_rate` | conf-cliff `detection_fail_rate` | signature |
+|---|---|---|---|
+| FP32-ONNX ↔ trt_cpp FP32 (strict, explicit) | 0% | 0% | plumbing baseline — clean, `max_diff` 5.8e-4–2.1e-3 |
+| FP32-ONNX ↔ trt_cpp FP16 (auto-loose) | 100% | **0%** | `max_diff` 3.97–13.7 (box-tail FP16 mantissa), cos ≥ 0.999999, 15/16 images `above_cliff X→X` clean — benign |
+| FP32-ONNX ↔ trt_cpp INT8 QDQ (tensor mode) | 100% | 6.25% | `max_diff` 275.7–511.5, cos 0.9939–0.9982; 12/16 images cliff churn (9 net-negative, 2 churn, 1 net-positive) — worst promoted=6/img vs the gate's 5/img threshold |
+| FP32-ONNX ↔ trt_cpp INT8 QDQ (detection mode) | 18.75% | — | per-image IoU/score gates: 3/16 fail (IoU 0.791–0.968, class match 1.000 everywhere, score drift 0.043–0.080) |
+
+The FP16 row's `max_diff` band (3.97–13.7) sits on the Python `tensorrt:` FP16
+pair's recorded band (3.7–12.9): the box-tail FP16 mantissa divergence is a
+property of the engine's precision, not of the backend driving it — the same
+serialized `.engine` under either driver produces the same divergence class,
+and the dual verdict reads identically (raw-tensor FAIL, detection PASS). The
+INT8 rows' signature — symmetric-backbone divergence with the head FP32 by
+QDQ omission, no catastrophic →0 flips, per-class mAP surface intact (below) —
+matches the Python-path QDQ pair's recorded structure (25.00% per-image gates
+there, 18.75% here; the two runs drove different engine builds, so the
+per-image flip sets are not expected to coincide, only the magnitude class).
+
+**Recorded benchmark** (the driver's `benchmark` stage: pass 2 is the recorded
+pass — cold-start GPU contention on a shared T4 pollutes pass 1 — plus the
+`--validation` mAP pass. Latency columns on the 16-image speed set at the
+canonical protocol `--warmup 10 --runs 25`; mAP columns on the full 397-image
+val split, native evaluator. All six rows come from one session on the same
+three engines — sha256 inventory in the session's `05a_models_sha256.log`;
+environment `tensorrt==10.16.1.11`, Python 3.13, torch 2.11.0+cu130, driver
+580.178.04 / CUDA 13.0. `RSS_Absolute_MB` is the `psutil` post-run process
+sample — see the memory-note column semantics below):
+
+| backend | FPS | p50 (ms) | Kernel_latency_ms | Kernel_fps | RSS_Increase_MB | RSS_Absolute_MB | mAP50 | mAP50-95 |
+|---|---|---|---|---|---|---|---|---|
+| `tensorrt` (FP32 engine) | 68.10 | 204.3 | 0.0073 | 136k | 317.7 | 1450.5 | 0.5896 | 0.4016 |
+| `trt_cpp` (FP32 engine) | 69.08 | 200.4 | 0.0041 | 244k | 27.0 | 1460.2 | 0.5896 | 0.4016 |
+| `tensorrt_fp16` | 79.82 | 174.7 | 0.0081 | 123k | 34.0 | 1469.1 | 0.5906 | 0.4027 |
+| `trt_cpp_fp16` | 84.06 | 165.5 | 0.0043 | 235k | 35.8 | 1478.7 | 0.5906 | 0.4027 |
+| `tensorrt_int8` | 79.80 | 172.7 | 0.0073 | 138k | 72.7 | 1516.6 | 0.5891 | 0.3938 |
+| `trt_cpp_int8` | 82.68 | 166.4 | 0.0038 | 263k | 38.7 | 1528.8 | 0.5891 | 0.3938 |
+
+Reading the table:
+
+* **Per-class mAP is bitwise identical within each pair** — every class, both
+  metrics, all three precisions (12/12 classes, delta 0.0 on all 24 numbers per
+  pair): the C++ forward returns the same engine output the Python driver
+  returns, so the mAP surface cannot distinguish the two backends on the same
+  serialized engine.
+* **e2e pairs sit inside the run-to-run spread** (FP32 68.1 vs 69.1, FP16 79.8
+  vs 84.1, INT8 79.8 vs 82.7 FPS): as with the ort_cpp finding, the honest
+  answer to "why isn't the C++ path faster" is that the e2e sweep is
+  host-dominated (NMS / letterbox / I/O) and the GPU forward is 0.0038–0.0081
+  ms against a 165–205 ms sweep. The backend choice moves the process surface,
+  not the FPS.
+* **The kernel window reads ~2× lower on the C++ timer** (0.0038–0.0043 vs
+  0.0073–0.0081 ms). At this scale the window is sync-path-bound rather than
+  kernel-bound: both timers bracket the stream synchronize, so the measured
+  difference is largely the Python call path around it, and the kernel
+  columns' run-to-run spread on this card remains comparable to the gap — the
+  Python-path run's durable statement (only the kernel columns can see
+  GPU-side differences at all) still holds.
+* **`RSS_Increase_MB` is a delta from a pre-load baseline sampled per backend
+  section inside one six-backend process**, so the first row (317.7 MB) also
+  carries the one-time process cost (CUDA context + the first engine's
+  allocations) — the `RSS_Absolute_MB` column (the `psutil` post-run sample)
+  makes the two readings visible per row: the first row's delta-vs-absolute
+  gap is that one-time cost, and the absolute column's monotone climb across
+  sections is the CUDA allocations none of the backends release into torch's
+  stats. Within the settled 27–73 MB delta band the FP16 pair is equal (34.0
+  vs 35.8) and the INT8 pair shows a reproducible within-session split (72.7
+  vs 38.7, the same pattern the first session showed at 78.0 vs 39.0); a
+  per-backend RSS claim needs a one-backend-per-process run, the ort_cpp
+  protocol.
 
 ## Architecture notes
 

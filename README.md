@@ -483,5 +483,5 @@ GitHub Actions runs the same two gates on every push to and pull request against
   (`trt_cpp:`, [docs/TENSORRT.md](docs/TENSORRT.md)) requires the optional `_trt_cpp` pybind11
   module built behind `BUILD_TRT_CPP=ON` (TensorRT + CUDA + pybind11, none vendored) — a box
   without them builds `ort_cpp` unchanged. The measured GPU figures recorded in
-  [docs/TENSORRT.md](docs/TENSORRT.md) cover the Python `tensorrt*` backends; the `trt_cpp`
-  backend shares their metric surface.
+  [docs/TENSORRT.md](docs/TENSORRT.md) cover the Python `tensorrt*` backends and the
+  `trt_cpp` backend (the trt_cpp recorded tables); both share the same metric surface.
