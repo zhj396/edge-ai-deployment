@@ -79,6 +79,62 @@ def resolve_ort_cpp_exe() -> str:
     )
 
 
+def _load_pybind_module(path: str, name: str):
+    """Load a compiled extension by absolute path via ``importlib.util``.
+
+    A Python-ABI mismatch (built for Py3.11, running under Py3.12) surfaces
+    as ``ImportError`` from ``exec_module`` here; re-raised as
+    ``RuntimeError`` with a rebuild hint.
+    """
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load pybind11 module from {path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # ABI mismatch raises ImportError here
+        return mod
+    except ImportError as e:
+        raise RuntimeError(
+            f"Failed to load {path}: {e}. This is usually a Python-ABI "
+            f"mismatch — rebuild with the same interpreter you run the CLI "
+            f"with (-DPython3_EXECUTABLE=$(which python))."
+        ) from e
+
+
+def resolve_trt_cpp_module():
+    """Locate + load the built ``_trt_cpp`` pybind11 module (in-process TRT C++).
+
+    Search order: ``TRT_CPP_PATH`` env (absolute .so/.pyd path) → the CMake
+    build output at ``cpp/build/tensorrt/_trt_cpp*.so|.pyd`` (globbed — the
+    SOABI-suffixed name varies by platform/Python, e.g.
+    ``_trt_cpp.cpython-311-x86_64-linux-gnu.so``). Raises ``RuntimeError``
+    pointing at the build command if absent.
+    """
+    env_path = os.environ.get("TRT_CPP_PATH")
+    if env_path and os.path.isfile(env_path):
+        return _load_pybind_module(env_path, "_trt_cpp")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    build_dir = repo_root / "cpp" / "build" / "tensorrt"
+    if build_dir.is_dir():
+        cands = sorted(build_dir.glob("_trt_cpp*.so"))
+        if platform.system() == "Windows":
+            cands += sorted(build_dir.glob("_trt_cpp*.pyd"))
+        # Prefer the plain-stem match (no SOABI suffix) if both exist.
+        plain = [c for c in cands if c.stem == "_trt_cpp"]
+        for c in (plain or cands):
+            return _load_pybind_module(str(c), "_trt_cpp")
+
+    raise RuntimeError(
+        "trt_cpp pybind11 module not found. Build it first: "
+        "`cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON && "
+        "cmake --build cpp/build --target _trt_cpp` (or set TRT_CPP_PATH to "
+        "the .so/.pyd absolute path). Requires TensorRT + CUDA + pybind11. "
+        "See docs/TENSORRT.md."
+    )
+
+
 def _thread_knobs() -> tuple:
     """The (intra, inter) thread values ``_make_session_options`` bakes in."""
     ncpu = os.cpu_count() or 1
@@ -303,6 +359,7 @@ class Benchmark:
             or backend in ("onnx_fp32", "onnx_int8")
             or backend.startswith("openvino")
             or backend.startswith("tensorrt")
+            or backend.startswith("trt_cpp")
         )
         if not supported:
             logger.warning(
@@ -318,6 +375,8 @@ class Benchmark:
             openvino_available,
             TensorRTEngine,
             tensorrt_available,
+            TensorRTEngineCpp,
+            trt_cpp_available,
         )
 
         data_yaml = Path(self.imgs_input) / "data.yaml"
@@ -367,7 +426,22 @@ class Benchmark:
                     max_batch=max(self.batch_size, 8), data_yaml=data_yaml,
                     device=_tensorrt_device_from_env(),
                 )
-
+            elif backend.startswith("trt_cpp"):
+                # In-process C++ pybind11 backend: same .engine and same
+                # metric surface (native mAP + kernel_latency_ms) as the
+                # Python tensorrt* backends.
+                if not trt_cpp_available():
+                    raise RuntimeError(
+                        "trt_cpp pybind11 module not built. Build it first: "
+                        "`cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON && "
+                        "cmake --build cpp/build --target _trt_cpp` (or set "
+                        "TRT_CPP_PATH). See docs/TENSORRT.md."
+                    )
+                engine = TensorRTEngineCpp(
+                    model_path=model_path, imgsz=self.imgsz,
+                    max_batch=max(self.batch_size, 8), data_yaml=data_yaml,
+                    device=_tensorrt_device_from_env(),
+                )
             # ort_cpp is a subprocess exe with no Python engine, so its row
             # skips the native evaluator.
             result = evaluate_map(
@@ -664,6 +738,21 @@ class Benchmark:
             "pip install -r requirements-tensorrt.txt",
         )
 
+    def _run_trt_cpp(self, backend: str, model_path: str) -> Dict:
+        """TensorRT serialized engine via the in-process C++ pybind11 backend.
+
+        Same ``.engine`` and same metric surface as :meth:`_run_tensorrt`
+        (native mAP via ``_compute_map_native`` + ``kernel_latency_ms``).
+        """
+        from . import TensorRTEngineCpp, trt_cpp_available
+        return self._run_tensorrt_family(
+            backend, model_path, TensorRTEngineCpp, trt_cpp_available,
+            "trt_cpp pybind11 module not built. Build it first: "
+            "`cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON && "
+            "cmake --build cpp/build --target _trt_cpp` (or set TRT_CPP_PATH). "
+            "See docs/TENSORRT.md.",
+        )
+
     def _run_tensorrt_family(
         self, backend: str, model_path: str,
         ctor, avail_fn, unavail_msg: str,
@@ -696,8 +785,10 @@ class Benchmark:
             max_batch=max(self.batch_size, 8),
             device=_tensorrt_device_from_env(),
         )
-        # Cap to the engine's effective max_batch (the serialized engine's
-        # optimization profile, 1 for a static engine).
+        # Cap to the engine's resolved max_batch — for both TRT backends this
+        # is derived from the serialized .engine (the optimization profile's
+        # MAX for a dynamic engine, 1 for a static engine), not the raw
+        # constructor value.
         eff = engine._effective_batch(self.batch_size)
 
         batches = list(self._build_batches(self.speed_imgs, eff))
@@ -906,6 +997,8 @@ class Benchmark:
                     speed = self._run_openvino(backend, model_path)
                 elif backend.startswith("tensorrt"):
                     speed = self._run_tensorrt(backend, model_path)
+                elif backend.startswith("trt_cpp"):
+                    speed = self._run_trt_cpp(backend, model_path)
                 else:
                     speed = self._run_onnx(backend, model_path)
 

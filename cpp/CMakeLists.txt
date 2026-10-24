@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)
 
 project(ORT_CPP
     LANGUAGES CXX
@@ -18,11 +18,16 @@ endif()
 
 # ----------------------------------------------------------------------------
 # OpenCV — the ddepth overload of cv::dnn::blobFromImage (the CV_32F arg) needs
-# OpenCV 4.0+; the 5-arg cv::dnn::NMSBoxes exists since 3.x. 4.6 is the lowest
-# version actually exercised (system package on Debian/Ubuntu); 4.7+ is fine too.
-# Bump this floor only if a newer op is introduced.
+# OpenCV 4.0+; the 5-arg cv::dnn::NMSBoxes exists since 3.x. So the TECHNICAL
+# floor is 4.0; 4.5 is the lowest version actually exercised — the Kaggle T4
+# base image (this project's documented deployment target) ships OpenCV 4.5.4,
+# and Debian/Ubuntu 22.04 ships 4.6.0; 4.6/4.7+ are fine too. Bump this floor
+# only if a newer op is introduced; lower it only down to 4.0 (the blobFromImage
+# ddepth overload). ort_cpp links ort_core_common, which uses only these ops.
+# The optional trt_cpp backend also links ort_core_common (the shared-core
+# build contract) but is forward-only and consumes no common-core symbol.
 # ----------------------------------------------------------------------------
-find_package(OpenCV 4.6 REQUIRED
+find_package(OpenCV 4.5 REQUIRED
     COMPONENTS core imgproc imgcodecs dnn
 )
 
@@ -170,10 +175,27 @@ option(YOLOV8_SANITIZE "Enable AddressSanitizer + UndefinedBehaviorSanitizer" OF
 
 # ----------------------------------------------------------------------------
 # Build the shared core, then the ORT backend. Each backend gets its own
-# cpp/<backend>/ directory with its own CMakeLists.txt.
+# cpp/<backend>/ + CMakeLists.txt.
 # ----------------------------------------------------------------------------
 add_subdirectory(common)
 add_subdirectory(onnxruntime)
+
+# ----------------------------------------------------------------------------
+# Optional: in-process TensorRT C++ pybind11 backend (_trt_cpp module). OFF by
+# default — requires TensorRT + CUDA + pybind11 (none vendored; the TensorRT
+# SDK alone is a multi-GB download);
+# a box without them must NOT fail the ort_cpp build (mirrors the Python side's
+# optional-dep posture: tensorrt / cuda-python are NOT in the base pin set).
+# The module is a forward-only accelerator (deserialize a .engine + run
+# enqueueV3 — the TRT C++ API — over the CUDA Runtime API); preprocess/postprocess
+# stay Python. See docs/TENSORRT.md (the trt_cpp backend).
+#   cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON
+#   cmake --build cpp/build --target _trt_cpp
+# ----------------------------------------------------------------------------
+option(BUILD_TRT_CPP "Build the in-process TensorRT C++ pybind11 backend (_trt_cpp)" OFF)
+if(BUILD_TRT_CPP)
+    add_subdirectory(tensorrt)
+endif()
 
 # ----------------------------------------------------------------------------
 # Status banner

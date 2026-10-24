@@ -126,14 +126,16 @@ def trt_forward_capped(engine, x_np: np.ndarray) -> np.ndarray:
     """Run one TensorRT forward, sub-looping when the batch exceeds the
     engine's per-forward bound.
 
-    ``TensorRTEngine._forward`` raises for a batch above ``max_batch``
-    (the serialized optimization-profile max), and the consistency harness
-    feeds whole preprocessed batches straight through, so the count is
-    capped via ``_effective_batch`` and the chunks' raw outputs are
-    concatenated in input order (the head layout ``[bs, 4+nc, N]`` stacks
-    on axis 0). ``raw_forward`` returns a view of the engine's reused host
-    output buffer, so each chunk is copied before the next forward
-    overwrites that buffer.
+    A TensorRT engine raises for a batch above ``max_batch`` (the serialized
+    optimization-profile max — Python ``TensorRTEngine._forward`` and the C++
+    ``TensorRTEngineCpp`` forward alike), and the consistency harness feeds
+    whole preprocessed batches straight through, so the count is capped via
+    ``_effective_batch`` and the chunks' raw outputs are concatenated in
+    input order (the head layout ``[bs, 4+nc, N]`` stacks on axis 0). Each
+    chunk's output is copied before the next forward runs: the Python
+    engine's ``raw_forward`` returns a view of its reused host output buffer
+    (the C++ engine instead memcpy's every output into a fresh numpy array,
+    so the copy is redundant but harmless there).
     """
     bs = int(x_np.shape[0])
     eff = engine._effective_batch(bs)
@@ -184,6 +186,10 @@ class ModelWrapper:
     # Backend selector for the TensorRT backend (mirrors benchmark's label).
     TENSORRT_PREFIX = "tensorrt:"
 
+    # Backend selector for the in-process TensorRT C++ pybind11 accelerator
+    # (the _trt_cpp module; mirrors benchmark's trt_cpp* labels).
+    TRT_CPP_PREFIX = "trt_cpp:"
+
     def __init__(self, model_path: str, device: str) -> None:
         spec = str(model_path)
         self.device = (
@@ -218,6 +224,16 @@ class ModelWrapper:
             # does not fail; only an actual forward call resolves it.
             self.type = "tensorrt"
             self.path = spec[len(self.TENSORRT_PREFIX):]
+            self.model_path = self.path
+            self.model = None
+            return
+        if spec.startswith(self.TRT_CPP_PREFIX):
+            # In-process TensorRT C++ pybind11 backend: the _trt_cpp module
+            # is resolved on the first forward call (the same lazy contract
+            # as ort_cpp:/tensorrt:) and consumes the already-preprocessed
+            # tensor ``x`` like the Python tensorrt: path.
+            self.type = "trt_cpp"
+            self.path = spec[len(self.TRT_CPP_PREFIX):]
             self.model_path = self.path
             self.model = None
             return
@@ -337,6 +353,28 @@ class ModelWrapper:
             # _forward raises above the engine's max_batch: the batch is
             # capped at that count and sub-looped here.
             return trt_forward_capped(self.model, x.detach().cpu().numpy())
+        if self.type == "trt_cpp":
+            # In-process TensorRT C++ pybind11 accelerator. Consumes the
+            # already-preprocessed tensor ``x`` like the Python tensorrt: path;
+            # the _trt_cpp module is resolved on the first forward (lazy).
+            if self.model is None:
+                from . import TensorRTEngineCpp, trt_cpp_available
+                if not trt_cpp_available():
+                    raise ImportError(
+                        "trt_cpp pybind11 module not built. Build it first: "
+                        "`cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON && "
+                        "cmake --build cpp/build --target _trt_cpp`"
+                    )
+                self.model = TensorRTEngineCpp(
+                    model_path=self.model_path, device=self._trt_gpu_id,
+                    imgsz=imgsz or 640,
+                )
+            # The C++ forward raises for a batch above the engine's
+            # max_batch (resolved from the serialized engine — profile MAX
+            # for a dynamic engine, 1 for a static engine — mirroring the
+            # Python tensorrt: cap), so the count is capped and sub-looped
+            # here like the tensorrt: path above.
+            return trt_forward_capped(self.model, x.detach().cpu().numpy())
         if self.type == "openvino":
             # OpenVINO consumes host numpy: the torch CUDA tensor is copied
             # to host before the forward (a --device cuda run with an
@@ -359,7 +397,7 @@ class ModelWrapper:
         resources release through GC or process exit, and OpenVINO holds no
         explicit device handles.
         """
-        if self.type == "tensorrt" and self.model is not None:
+        if self.type in ("tensorrt", "trt_cpp") and self.model is not None:
             release = getattr(self.model, "release", None)
             if callable(release):
                 release()
@@ -783,9 +821,9 @@ def validate_consistency(
                 )
 
     finally:
-        # A tensorrt: wrapper's .engine is deserialized lazily on the first
-        # forward; release both wrappers so its stream, device buffers, and
-        # primary context do not outlive the run (a no-op for the other
+        # A tensorrt:/trt_cpp: wrapper's engine is resolved lazily on the
+        # first forward; release both wrappers so its stream, device buffers,
+        # and primary context do not outlive the run (a no-op for the other
         # backends and for wrappers that never ran a forward).
         model_obj1.release()
         model_obj2.release()

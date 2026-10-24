@@ -34,9 +34,13 @@ cpp/
 
 **Why the split.** `cpp/common/` has **no ONNX Runtime dependency** — it links only OpenCV
 (+ the yaml parser). The ORT-specific code (session, `Ort::Value` tensor wrapping) lives in
-`cpp/onnxruntime/`. A backend links `ort_core_common` (the documented shared-core contract)
-and hands the core a raw `float*` + shape, keeping the shared preprocess/postprocess core
-single-sourced in C++.
+`cpp/onnxruntime/`. The backends differ in what they hand the core: the ort_cpp driver's
+`preprocessor`/`postprocessor` call it with a raw `float*` + shape, keeping the shared
+preprocess/postprocess core single-sourced in C++. The `cpp/tensorrt/` backend (see
+`docs/TENSORRT.md`) follows the same directory layout and links `ort_core_common` (the
+documented shared-core contract), but its pybind11 module is a forward-only accelerator —
+preprocess/postprocess stay on the Python core (`src/preprocess` + `src/postprocess`), so it
+consumes no common-core symbol; the link is the build-layout contract, not a code path.
 
 **SDK path.** The ONNX Runtime SDK lives at `cpp/third_party/onnxruntime/` — *not*
 `cpp/onnxruntime/`. The latter path is reserved for the backend *source*. `ONNXRUNTIME_DIR`
@@ -78,8 +82,8 @@ The C++ core is written to be numerically consistent with the Python preprocess/
 
 ## Build
 
-Requires CMake ≥ 3.16, a C++17 compiler, and OpenCV ≥ 4.6 (`core imgproc imgcodecs dnn`;
-4.6 is the floor `cpp/CMakeLists.txt` actually declares). The ONNX Runtime **SDK tarball** is
+Requires CMake ≥ 3.18, a C++17 compiler, and OpenCV ≥ 4.5 (`core imgproc imgcodecs dnn`;
+4.5 is the floor `cpp/CMakeLists.txt` actually declares). The ONNX Runtime **SDK tarball** is
 committed at `cpp/third_party/onnxruntime-linux-x64-1.20.0.tgz`; the extracted tree is **not**
 tracked (it's gitignored) — `cmake` auto-extracts it on first configure.
 
