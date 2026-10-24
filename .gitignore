@@ -36,3 +36,27 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# C++ build artifacts (cpp/build/, cmake generated)
+cpp/build/
+build/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.o
+*.obj
+*.exp
+*.pdb
+*.ilk
+.vs/
+# Staging dir left behind if third_party/setup-onnxruntime.sh is killed
+# before its EXIT trap fires.
+cpp/third_party/.ort-extract.*
+
+# ONNX Runtime SDK: the release tarball is committed for reproducibility; the
+# extracted tree (third_party/onnxruntime/, incl. the platform-specific .so/.dll
+# in lib/) is generated automatically — by `cmake` configure (auto-extract) or by
+# third_party/setup-onnxruntime.sh — and is not tracked. Override the SDK
+# location entirely with the ONNXRUNTIME_DIR env var.
+cpp/third_party/onnxruntime/

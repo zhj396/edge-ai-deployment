@@ -50,6 +50,17 @@ _clean_find -type d -name "__pycache__" -print -exec rm -rf {} +
 _clean_find -type d -name ".pytest_cache" -print -exec rm -rf {} +
 
 # ---------------------------------------------------------------------------
+# C++ backend artifacts: the cmake build tree and the extracted ONNX Runtime
+# SDK (cpp/third_party/onnxruntime/, plus the .ort-extract.* extract temps).
+# Scoped to the generated content — the committed SDK tarball and
+# setup-onnxruntime.sh remain; cpp/third_party/setup-onnxruntime.sh restores
+# the extracted tree.
+# ---------------------------------------------------------------------------
+rm -rf cpp/build
+rm -rf cpp/third_party/onnxruntime
+rm -rf cpp/third_party/.ort-extract.*
+
+# ---------------------------------------------------------------------------
 # Runtime outputs
 # ---------------------------------------------------------------------------
 rm -rf logs

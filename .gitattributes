@@ -16,4 +16,5 @@
 *.bin binary
 *.engine binary
 *.tar.gz binary
+*.tgz binary
 *.zip binary
