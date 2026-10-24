@@ -83,3 +83,33 @@ def test_run_all_continues_past_failed_backend(monkeypatch):
 
     assert calls == ["pytorch", "onnx_fp32"]
     assert list(df["Backend"]) == ["pytorch", "onnx_fp32"]
+
+
+def test_summary_csv_columns_include_rss_absolute():
+    """The summary CSV carries the absolute-RSS column next to the delta.
+
+    RSS_Increase_MB mixes one-time process cost (CUDA context, first backend
+    in a multi-backend single-process run) with per-backend cost; the
+    absolute RSS_Absolute_MB column makes both readings visible per row
+    (the ort_cpp row reports the C++ process's absolute peak there).
+    """
+    b = Benchmark.__new__(Benchmark)
+    b.validation = False
+    b.timestamp_suffix = "_test"
+
+    frames = {}
+
+    def _fake_to_csv(self, path, **kwargs):
+        frames["df"] = self
+
+    import pandas as pd
+    monkeypatch_like = pd.DataFrame.to_csv
+    pd.DataFrame.to_csv = _fake_to_csv
+    try:
+        b.run_all({"onnx_fp32": "models/whatever.onnx"})
+    finally:
+        pd.DataFrame.to_csv = monkeypatch_like
+
+    cols = list(frames["df"].columns)
+    assert "RSS_Increase_MB" in cols and "RSS_Absolute_MB" in cols
+    assert cols.index("RSS_Absolute_MB") == cols.index("RSS_Increase_MB") + 1

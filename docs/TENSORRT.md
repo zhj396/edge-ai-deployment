@@ -6,6 +6,14 @@ mirrors `OpenVINOEngine`'s API (`infer` / `infer_frames` / `_run_batch` with an
 explicit `nc=`), registered in `src/__init__.py::_LAZY`, reusing the shared
 `src/preprocess` + `src/postprocess` core like every other Python backend.
 
+Two backend surfaces drive the same serialized `.engine`:
+
+- **`tensorrt:` (Python)** — `src/tensorrt_engine.py`, the cuda-python Driver-API
+  engine (this document's main subject).
+- **`trt_cpp:` (C++, in-process)** — `src/tensorrt_cpp_engine.py` + the optional
+  `_trt_cpp` pybind11 module (`cpp/tensorrt/`, built behind `BUILD_TRT_CPP=ON`),
+  see [the trt_cpp backend](#the-trt_cpp-backend-in-process-c-pybind11-accelerator).
+
 ## Pinned environment and TRT-10 API
 
 TensorRT 10.16.1 pinned for the **Kaggle Tesla T4 (sm_75)** environment where
@@ -431,6 +439,79 @@ and only the kernel columns can see GPU-side differences at all. (The
 per-image detection counts agree with the FP32-TRT row on 396 of 397
 images, the remaining image by a single detection.)
 
+## The trt_cpp backend (in-process C++ pybind11 accelerator)
+
+`trt_cpp:` drives the **same serialized `.engine`** as `tensorrt:` in-process —
+no subprocess, no `.npy` exchange (`ort_cpp` stays the subprocess backend) —
+through a forward-only C++ pybind11 module (`cpp/tensorrt/`, module name
+`_trt_cpp`). `src/tensorrt_cpp_engine.py::TensorRTEngineCpp` mirrors
+`TensorRTEngine`'s API (`__init__` / `raw_forward` / `kernel_timed_forward` /
+`_effective_batch` / `_run_batch` / `infer` / `infer_frames` / `release` /
+context manager), delegating only the GPU forward to C++; preprocess and
+postprocess stay on the shared Python core. The metric surface matches the
+Python `tensorrt:` path: native mAP (the backend-agnostic evaluator driving
+`infer()`) + `kernel_latency_ms`.
+
+> **T4 session driver.** On a Kaggle T4 (or any GPU box),
+> `scripts/kaggle_trt_cpp_session.sh` drives the full measurement session as
+> self-contained stages — `deps` (pip overlays + Release artifacts + the CUDA
+> loader env: onnxruntime-gpu's CUDA-12 libraries come from the pip `nvidia-*`
+> wheels and need `LD_LIBRARY_PATH` set), `build` (canonical FP32 ONNX + FP32/
+> FP16/INT8-QDQ engines), `trt-cpp` (tarball subset + `_trt_cpp` build),
+> `consistency`, `benchmark` (two passes; the second is the recorded one),
+> `archive`. Each stage re-derives its environment, so
+> `bash scripts/kaggle_trt_cpp_session.sh <stage>` behaves identically from a
+> notebook cell or a fresh terminal; the per-stage commands below are the
+> canonical form the stages sequence.
+
+```bash
+# C++ deps (apt OpenCV dev + the TRT 10.16.1 tarball + env exports):
+source scripts/trt_cpp_setup.sh
+# Build the module (OFF by default — a box without TensorRT + CUDA +
+# pybind11 must not fail the ort_cpp build):
+cmake -S cpp -B cpp/build -DBUILD_TRT_CPP=ON
+cmake --build cpp/build --target _trt_cpp
+```
+
+Contract notes:
+
+* **C++ scope.** `trt_engine.cpp` deserializes via `createInferRuntime` +
+  `deserializeCudaEngine` and runs `enqueueV3` (the TRT-10 C++ tensor-name
+  API: `getNbIOTensors` / `getTensorIOMode` / `setTensorAddress` /
+  `setInputShape`) over the CUDA **Runtime** API
+  (`cudaMalloc` / `cudaMemcpyAsync` / `cudaStreamSynchronize`) — the Runtime
+  API auto-manages the primary context, so there is no
+  `cuCtxPushCurrent`/`cuCtxPopCurrent` (the Python engine's push/pop is a
+  Driver-API artifact via cuda-python lean bindings). Load-only: building
+  stays in Python, so the module links `nvinfer` only, no `nvonnxparser`.
+  Float32 engine IO is gated up front (the forward path memcpys raw float32
+  bytes both directions), and the caller's input C/H/W is checked against
+  the engine's resolved shape before the H2D memcpy. The host staging vector
+  is copied into the returned numpy array — no capsule/shared ownership
+  across the boundary. The per-forward batch bound (profile MAX / 1 for
+  static) is resolved at deserialize time and exposed through the
+  `max_batch` property.
+* **Concurrent construction of both TRT backends is not supported.** The
+  Python path retains a primary context via the Driver API; the C++ path uses
+  the Runtime API's auto-managed one (refcounted). `benchmark` serializes the
+  two engines' lifecycles with `release()` between backends.
+* **Module resolution.** `src.benchmark.resolve_trt_cpp_module` reads the
+  `TRT_CPP_PATH` env override first, then globs the CMake build output
+  (`cpp/build/tensorrt/_trt_cpp*.so|.pyd`); a Python-ABI mismatch re-raises as
+  `RuntimeError` with a rebuild hint. Importing
+  `src.tensorrt_cpp_engine` without the built module does not fail — only an
+  actual forward resolves it (the same optional-dep posture as
+  `tensorrt` / `openvino`; the model-free tests assert the contract).
+* **CLI prefixes.** `consistency --model2 trt_cpp:<engine>` (lazy
+  `ModelWrapper` detection, like `tensorrt:`) and `benchmark --model
+  trt_cpp:|trt_cpp_fp16:|trt_cpp_int8:<engine>` (shared `_run_tensorrt_family`
+  body with the Python `tensorrt*` rows).
+* **C++ deps setup.** `scripts/trt_cpp_setup.sh` owns the non-pip C++ build
+  deps (apt OpenCV dev + the TRT tarball + env exports); pip owns the Python
+  wheels. It verifies (does not install) that the installed `tensorrt` wheel
+  matches the tarball, so the `.engine` cross-loads (TRT engines are
+  version-locked across major versions).
+
 ## Architecture notes
 
 * **Optional-dep guard.** `try: import tensorrt as trt; from cuda.bindings
@@ -449,10 +530,13 @@ images, the remaining image by a single detection.)
   pushed.
 * **Dynamic batch.** `set_input_shape` per forward sets the actual batch
   count; every count in the profile range (1..`max_batch`) runs directly.
-  `_effective_batch` caps the requested count (the `infer` /
-  `infer_frames` loops step over forwards at it); the effective `max_batch`
-  is the constructor value capped by the serialized engine's
-  optimization-profile max, and a static engine (no profile) steps at 1.
+  `_effective_batch` caps the requested count (the `infer` / `infer_frames`
+  loops step over forwards at it). Both TRT backends resolve the effective
+  `max_batch` from the serialized engine — the optimization profile's MAX
+  for a dynamic engine, 1 for a static engine (no profile) — the Python
+  `TensorRTEngine` at load time, the C++ `TrtEngine` at deserialize time
+  (exposed to the wrapper through the `max_batch` property), so both step
+  at the same per-forward bound.
 * **Shared core.** `TensorRTEngine` consumes `preprocess_imgs` /
   `preprocess_frames` host numpy and calls `post_process(nc=len(
   class_names))`. Preprocess / postprocess / sampler / export / benchmark /
