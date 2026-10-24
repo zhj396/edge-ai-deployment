@@ -75,7 +75,11 @@ pair is:
 # by px-scale amounts — the same low-impact tail ARCHITECTURE.md §11
 # documents for INT8.
 # Read its stats, don't read its PASS/FAIL; the verdict is detection mode.
-# Measured: `_TBD_` — filled by the recorded-run provenance note below.
+# Measured (2026-10-24, see the provenance note below): mean_diff 0.0100 /
+# p95 0.0473 / p99 0.1816 / box max_diff 5.57 (3.53 batch-mean) /
+# cosine 0.9999998 — cls channels stay at ~1e-7 mean diff; the entire
+# delta is the box-coordinate tail. fail_rate 100% at the per-element
+# gate, as expected.
 python main.py consistency \
     --model1 models/yolov8s_fp32.onnx \
     --model2 openvino:models/yolov8s_openvino.xml \
@@ -84,7 +88,11 @@ python main.py consistency \
 
 # INT8 IR, detection mode — the FP32↔INT8 convention (IoU/class/score
 # gates absorb px-scale box tails), directly comparable to the ORT INT8
-# consistency result. Measured: `_TBD_` — see the provenance note below.
+# consistency result. Measured (2026-10-24, see the provenance note
+# below): 14/16 images pass; mean IoU 0.981, class match 1.000,
+# score diff 0.020, count diff 0.25, recall match 0.927, advisory
+# cosine 0.9990 — fail_rate 12.5% (the same-order pass band as the ORT
+# INT8 path).
 python main.py consistency \
     --model1 models/yolov8s_fp32.onnx \
     --model2 openvino_int8:models/yolov8s_openvino_int8.xml \
@@ -99,17 +107,46 @@ sort, e.g. `ls results/consistency_openvino_*.json | sort | tail -1`.)
 
 Provenance of the measured figures above (reproducibility rules):
 
-> Measured figures are recorded as `_TBD_` until a run on the pinned
-> environment fills them with its own recorded logs; the provenance block
-> (date, host, package pins, config) is filled together with them.
+* Date: 2026-10-24.
+* Host: Windows 11 + WSL2 Ubuntu, Python 3.12.3, 13th Gen Intel Core
+  i5-13420H (12 threads, no AVX-512).
+* Packages: openvino 2026.3.0, nncf 3.3.0, onnxruntime 1.26.0,
+  torch 2.6.0+cpu.
+* Config: `OPENVINO_DEVICE=CPU` (default; actual device CPU, no fallback),
+  imgsz 640, batch 1; default `--max-images` budget (20) → 16
+  sampler-selected images from the 397-image val split; reports under
+  `results/`, located by the newest-name sort rule above.
+* Reading the FP16 result: the raw-tensor FAIL is expected and carries no
+  verdict — the per-element gate flags px-scale box tails while the cls
+  channels sit at ~1e-7 mean diff and cosine ≥ 0.9999998. The INT8
+  detection verdict is the release-relevant one: mean IoU 0.981 with
+  class match 1.000 and score diff 0.020 sits in the same band as the
+  ORT INT8 path's detection run (2026-10-15, 13/16 images, mean IoU
+  0.980); the 2 failing images are both recall-gated (recall 0.50 / 0.33,
+  count_diff 2, class match 1.0).
 
-**FP16 delta channel split (one-off analysis; measured figures `_TBD_`).**
+**FP16 delta channel split (measured 2026-10-24, one-off analysis; the
+analysis record lives under `results/`).**
 The per-image `cls_*` stats in the consistency report only cover the cls half of the claim;
-a one-off analysis reruns the same pipeline piece for piece — the same sampler selection
+so a one-off analysis reran the same pipeline piece for piece — the same sampler selection
 (budget 20 → the same 16 images), the same `preprocess_imgs` + `ModelWrapper` forwards — and
-splits the raw `[1, 16, 8400]` output into box (channels 0:4) and cls (channels 4:) groups,
+split the raw `[1, 16, 8400]` output into box (channels 0:4) and cls (channels 4:) groups,
 reporting per-group mean/max/p99 abs diff and cosine and localizing the per-element gate
-violations (atol 1e-3 / rtol 1e-2) to the two groups. Measured results: `_TBD_`.
+violations (atol 1e-3 / rtol 1e-2) to the two groups. Result over the 16 images
+(2,150,400 elements total):
+
+* **The delta is the box tail, quantitatively.** 646 tolerance violations in total —
+  637 (98.6%) in the box channels, 9 in cls. Box: mean abs diff 0.0398, p99 ≤ 0.486,
+  max 5.57 (reproduces the recorded tensor-run max), cosine ≥ 0.9999998. Cls:
+  mean abs diff 2.2e-7, min cosine 0.99997 — float noise, as claimed.
+* **The 9 cls violations are one outlier element** (0.0121 on one image's logit,
+  every other image ≤ 2.9e-3) — negligible after the head's sigmoid, and irrelevant
+  to detection mode, which is the verdict that counts.
+* **w/h channels carry more delta than x/y** (mean abs diff 0.075 / 0.050 vs
+  0.017 / 0.017; max 5.57 / 4.15 vs 2.52 / 1.95) — consistent with the DFL decode
+  exponentiating widths/heights, which amplifies FP16 rounding.
+* Cross-check: box mean 0.0398 over 4 of 16 channels ≈ the recorded run's overall
+  `mean_diff` 0.0100 — the two measurements are one consistent dataset.
 
 Implementation notes: `ModelWrapper` in `src/consistency.py` dispatches the
 `openvino:`/`openvino_int8:` prefixes to an `OpenVINOEngine` (the prefix is
@@ -269,10 +306,17 @@ OPENVINO_DEVICE=GPU python main.py benchmark \
 
 ## Measured Performance (Intel Core i5-13420H, YOLOv8s 640×640, batch=1)
 
-> Provenance: figures recorded as `_TBD_` until a run on the pinned
-> environment fills them with its own recorded logs — the provenance block
-> (date, host, package pins, config, summary CSV) is filled together with
-> the table and the reading below.
+> Provenance: recorded 2026-10-24, idle host, Windows 11 + WSL2 Ubuntu,
+> Python 3.12.3, 13th Gen Intel Core i5-13420H (12 threads, no AVX-512);
+> openvino 2026.3.0, nncf 3.3.0, onnxruntime 1.26.0, torch 2.6.0+cpu;
+> imgsz 640, batch 1, 14 images (sampler budget 16), warmup 5, runs 10;
+> `OPENVINO_DEVICE=CPU` (no fallback — both OpenVINO rows resolved to
+> CPU); the INT8 IR is quantized through `openvino quantize` (its
+> head-exclusion scope — name-pattern `/model.22/` + `Sigmoid`/`Softmax`
+> floor, defined in `src/openvino_convert.py` — keeps the Detect head out
+> of INT8; its weights are written FP16 by `ov.save_model`'s default
+> compression); summary CSV under `results/` (the newest
+> `benchmark_summary_*.csv` by name sort).
 >
 > Column semantics: `p50`/`p99` are percentiles of one **full benchmark run**
 > (all images, end-to-end: preprocess → forward → NMS), not per-image
@@ -281,11 +325,11 @@ OPENVINO_DEVICE=GPU python main.py benchmark \
 
 | Backend         | Precision          | p50 (ms) | p99 (ms) | FPS   | Peak Mem (MB) |
 |-----------------|--------------------|----------|----------|-------|---------------|
-| PyTorch (eager) | FP32               | `_TBD_`  | `_TBD_`  | `_TBD_` | `_TBD_` |
-| ONNX Runtime    | FP32               | `_TBD_`  | `_TBD_`  | `_TBD_` | `_TBD_` |
-| ONNX Runtime    | INT8 QDQ           | `_TBD_`  | `_TBD_`  | `_TBD_` | `_TBD_` |
-| **OpenVINO**    | **FP16 IR**        | `_TBD_`  | `_TBD_`  | `_TBD_` | `_TBD_` |
-| **OpenVINO**    | **INT8 IR (NNCF)** | `_TBD_`  | `_TBD_`  | `_TBD_` | `_TBD_` |
+| PyTorch (eager) | FP32               | 2761     | 2889     | 5.09  | 569           |
+| ONNX Runtime    | FP32               | 2037     | 2136     | 6.92  | 698           |
+| ONNX Runtime    | INT8 QDQ           | 1282     | 1436     | 10.89 | 608           |
+| **OpenVINO**    | **FP16 IR**        | 2483     | 2591     | 5.60  | 932           |
+| **OpenVINO**    | **INT8 IR (NNCF)** | 1560     | 1653     | 8.98  | 803           |
 
 Reproduce the run: quantize the INT8 IR with `openvino quantize`, then
 benchmark on an idle host:
@@ -305,11 +349,20 @@ python main.py benchmark \
     --imgs-input data --max-images 16 --warmup 5 --runs 10
 ```
 
-Reading the table (filled with the recorded run):
+Reading the table (same recorded run, 2026-10-24):
 
-* `_TBD_` — INT8 across both runtimes, the FP16-vs-FP32 comparison, the
-  peak-memory ordering, and the single-process provenance of the five rows
-  are filled together with the table.
+* **INT8 across both runtimes:** ORT INT8 QDQ (10.89 FPS) vs OpenVINO INT8
+  IR (8.98 FPS) — on this silicon the ORT QDQ path leads, and both INT8
+  forms beat their FP32/FP16 counterparts (ORT FP32 6.92, OpenVINO FP16
+  5.60 FPS). The hypothesis that OpenVINO's VNNI INT8 kernels dominate ORT
+  QDQ on a no-AVX-512 part is not supported by this run.
+* **FP16 IR:** slower than ONNX FP32 (5.60 vs 6.92 FPS) — FP16 weight
+  compression on a CPU-only path buys footprint, not speed, here.
+* **Footprint:** peak memory orders OpenVINO FP16 (932 MB) > OpenVINO INT8
+  (803 MB) > ORT FP32 (698 MB) > ONNX INT8 (608 MB) ≈ PyTorch (569 MB);
+  the OpenVINO runtime carries a higher resident baseline on this host.
+* All five rows come from one process; per-backend RSS increase and the
+  full percentile set are in the CSV.
 
 Not measurable in the validated set:
 
