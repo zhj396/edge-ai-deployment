@@ -35,9 +35,9 @@ cpp/
 
 **Why the split.** `cpp/common/` has **no ONNX Runtime dependency** — it links only OpenCV
 (+ the yaml parser). The ORT-specific code (session, `Ort::Value` tensor wrapping) lives in
-`cpp/onnxruntime/`. A backend links `ort_core_common` (the documented shared-core contract)
-and hands the core a raw `float*` + shape, keeping the shared preprocess/postprocess core
-single-sourced in C++.
+`cpp/onnxruntime/`. A backend links `ort_core_common` (the documented
+shared-core contract) and hands the core a raw `float*` + shape, keeping the
+shared preprocess/postprocess core single-sourced in C++.
 
 **SDK path.** The ONNX Runtime SDK lives at `cpp/third_party/onnxruntime/` — *not*
 `cpp/onnxruntime/`. The latter path is reserved for the backend *source*. `ONNXRUNTIME_DIR`
@@ -152,7 +152,62 @@ its owning thread's `worker_id` (the thread's index 0..N-1); a worker
 runs one task at a time, so each detector is touched by exactly one thread. This matters because
 a `YOLOv8` instance is **not
 reentrant**: `Preprocessor` reuses a single NCHW buffer / letterbox canvas / `Ort::Value` per
-`detect()` and `detect()` mutates `profile_result_` — a detector shared across two pool
-threads would race on them, because the shared queue lets any free
-thread grab any task. (ORT `Session::Run` itself is thread-safe; the constraint is the
-per-instance preprocessor buffer + `profile_result_`.)
+`detect()` and `detect()` mutates `profile_result_`. (ORT `Session::Run` itself is thread-safe;
+the constraint is the per-instance preprocessor buffer + `profile_result_.`)
+
+## Harness integration
+
+`ort_cpp` is reachable from both Python harnesses through the `ort_cpp:<onnx>` backend
+prefix (a thin subprocess wrapper — the exe and Python must run under the **same**
+environment, both in WSL/Linux or both native Windows; the exe is a native binary, not
+cross-ABI). `resolve_ort_cpp_exe` (`src/benchmark.py`) locates the binary via the
+`ORT_CPP_PATH` env var, falling back to `cpp/build/onnxruntime/ort_cpp`; it raises a
+"build it first" error when neither exists.
+
+### Benchmark (`python main.py benchmark`)
+
+`--model ort_cpp:models/yolov8s_fp32.onnx` stages the speed-test images into a temp dir
+with zero-padded names so the C++ `--dir` loader times the *same* images the Python
+backends timed. The timing scopes differ: the C++ benchmark times `detect()` =
+preprocess + infer + postprocess + NMS on already-decoded images, while the Python
+timed loop includes image decode inside `preprocess` — so the Python rows carry decode
+cost the C++ rows do not; the C++ protocol is also per-iteration while the Python loop is
+per-sweep, so treat cross-protocol rows as indicative. The warmup counts differ too: the
+driver warms a fixed 3 iterations before its timed loop, so the CLI `--warmup` count
+applies to the Python rows only. The exe's per-image numbers are mapped into
+the summary CSV (sweep-scaled percentiles; peak RSS reported as an absolute value — the C++
+process has no Python baseline, `rss_increase_mb` is 0). Batch is **1** (the exe has no
+batched-forward path); the requested `--batch-size` is kept as the `requested_batch_size`
+metrics key (it is not a summary-CSV column). mAP
+`--validation` is unsupported for this backend — there is no Python engine to drive the
+native evaluator; the precision signal for the C++ path is the consistency harness.
+
+### Consistency (`python main.py consistency`)
+
+`--model1 models/yolov8s_fp32.onnx --model2 ort_cpp:models/yolov8s_fp32.onnx` runs the
+**full-pipeline** comparison: the C++ side re-letterboxes from the image paths with its
+own `cpp/common/letterboxInto` (mirroring `src/preprocess.py::letterbox`), so the run
+validates the C++ preprocess+forward mirror end-to-end. The wrapper stages each batch into a
+temp in-dir and rejects suffixes outside `.jpg/.jpeg/.png/.bmp` at staging time (the same
+contract as the benchmark's staging — the C++ `--dir` loader would silently drop them). It shells
+out to `--dump-raw-dir` once per batch, loads the `.npy`
+files back in sorted order, and `np.concatenate`s them to `(bs, C, N)` — the same shape
+`ort_forward` produces, so `compare_tensors` and the detection-mode gates run unchanged.
+Thread knobs (`--intra-op-threads` / `--inter-op-threads`) are passed from
+`_thread_knobs()`; note the Python comparison session is built without
+`SessionOptions` (ORT defaults), so the two sides do not share one
+operator-scheduling/reduction order.
+
+### `--dump-raw-dir` (the C++ mode the consistency wrapper drives)
+
+```bash
+ort_cpp --dump-raw-dir <out_dir> --dir <in_dir> \
+    -m models/yolov8s_fp32.onnx --imgsz 640 --intra-op-threads 4 --inter-op-threads 2
+```
+
+Loads the model **once**, iterates the (sorted) images in `<in_dir>`, runs
+`YOLOv8::forwardRaw` (letterbox + `Session::Run`, no decode/NMS), and writes each raw
+output to `<out_dir>/<stem>.npy` — the input's stem with its extension stripped
+(little-endian float32, shape `(1, 4+nc, 8400)`).
+The npy writer is hand-rolled (no numpy dep on the C++ side). Requires `--dir`;
+ignores `--conf`/`--iou` (raw output is pre-NMS).

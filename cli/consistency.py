@@ -13,6 +13,21 @@ from src import validate_consistency
 logger = get_logger(__name__)
 
 
+def _resolve_consistency_model(arg, default):
+    """Resolve a --model1/--model2 arg, allowing a backend prefix.
+
+    A prefixed spec (``ort_cpp:<onnx>`` / ``openvino(_int8):<xml>``) is a
+    backend selector, not a path — pass it through verbatim;
+    ``ModelWrapper`` parses the prefix (ort_cpp resolves its exe lazily on
+    the first forward; openvino(_int8) loads the .xml at construction). A
+    plain value is passed through unchanged; the existing-validated default
+    applies only when the flag is omitted.
+    """
+    if arg and str(arg).startswith(("ort_cpp:", "openvino:", "openvino_int8:")):
+        return arg
+    return arg if arg is not None else existing_validation(default)
+
+
 # =========================================================
 # Add CLI subparser
 # =========================================================
@@ -29,12 +44,17 @@ def add_parser(subparsers):
     # documented defaults to ``run()`` via ``existing_validation``.
 
     parser.add_argument(
-        "--model1", type=Path, default=None,
-        help=f"Reference model (default: {DEFAULT_MODEL_PT})",
+        "--model1", type=str, default=None,
+        help=f"Reference model (default: {DEFAULT_MODEL_PT}). Prefix "
+        f"'ort_cpp:' for the C++ backend (requires the built ort_cpp exe; "
+        f"see docs/ORT_CPP.md), or 'openvino:' / 'openvino_int8:' to compare "
+        f"an OpenVINO IR, e.g. 'openvino_int8:models/yolov8s_openvino_int8.xml' "
+        f"(OPENVINO_DEVICE env var selects CPU/GPU/AUTO).",
     )
     parser.add_argument(
-        "--model2", type=Path, default=None,
-        help=f"Comparison model (default: {DEFAULT_MODEL_FP32})",
+        "--model2", type=str, default=None,
+        help=f"Comparison model (default: {DEFAULT_MODEL_FP32}). Accepts the "
+        f"'ort_cpp:', 'openvino:' and 'openvino_int8:' prefixes like --model1.",
     )
     parser.add_argument(
         "--imgs-input", type=Path, default=None,
@@ -91,10 +111,8 @@ def run(args):
         f"{args.report_path.stem}{ts}{args.report_path.suffix}"
     )
     cfg = ConsistencyConfig(
-        model1=(args.model1 if args.model1 is not None
-                else existing_validation(DEFAULT_MODEL_PT)),
-        model2=(args.model2 if args.model2 is not None
-                else existing_validation(DEFAULT_MODEL_FP32)),
+        model1=_resolve_consistency_model(args.model1, DEFAULT_MODEL_PT),
+        model2=_resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32),
         imgs_input=(args.imgs_input if args.imgs_input is not None
                     else existing_validation(DEFAULT_DATA_DIR)),
         mode=args.mode,
@@ -107,8 +125,10 @@ def run(args):
         rtol=args.rtol,
         report_path=report_path,
     )
+    # Log the full model spec (not Path.name): for prefixed specs the
+    # backend prefix is the only signal of which engine runs.
     logger.info(
-        f"Starting consistency check: {Path(cfg.model1).name} vs {Path(cfg.model2).name}"
+        f"Starting consistency check: {cfg.model1} vs {cfg.model2}"
     )
     results = validate_consistency(
         model1=cfg.model1,

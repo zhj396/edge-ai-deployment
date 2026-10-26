@@ -21,6 +21,8 @@ import gc
 import json
 import os
 import shutil
+import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
@@ -38,6 +40,12 @@ from utils import (
     get_logger,
     select_providers,
 )
+
+# The exe lookup is single-sourced in benchmark (ORT_CPP_PATH env override,
+# then the CMake build output, then the "build it first" error), as is the
+# staged-image suffix allowlist. No cycle: benchmark only imports
+# preprocess/postprocess, not consistency.
+from .benchmark import resolve_ort_cpp_exe, _thread_knobs, ORT_CPP_IMAGE_SUFFIXES
 # Pure-NumPy comparison helpers live in utils.comparison so the test suite
 # doesn't need ultralytics. Re-exported below for
 # ``from src.consistency import compare_tensors`` etc.
@@ -115,7 +123,7 @@ def ort_forward(
 # Unified model wrapper
 # ---------------------------------------------------------------------------
 class ModelWrapper:
-    """Unified interface for PyTorch, ONNX, and OpenVINO-IR models.
+    """Unified interface for PyTorch, ONNX, OpenVINO, and ORT-C++ models.
 
     ``model_path`` additionally accepts a ``backend:path`` spec:
     ``openvino:models/yolov8s_openvino.xml`` or ``openvino_int8:models/...
@@ -123,13 +131,39 @@ class ModelWrapper:
     (the precision is opaque to the wrapper — the ``_int8`` alias exists so
     the two precision variants stay visually distinct in commands). The
     plain ``.pt`` / ``.pth`` / ``.onnx`` forms are unchanged.
+
+    An ``ort_cpp:<onnx_path>`` prefix selects the C++ ORT backend: no in-process
+    session is loaded; ``forward`` shells out to the built ``ort_cpp``
+    exe in ``--dump-raw-dir`` mode, which re-letterboxes from the image paths
+    and writes raw pre-NMS forward tensors.
+    This is the **full-pipeline** consistency path — the C++ preprocess
+    (``cpp/common/letterbox.cpp``) is exercised alongside the forward, so the
+    comparison validates the C++ mirror of the Python preprocess+forward
+    end-to-end.
     """
 
     # Prefixes that route to OpenVINOEngine (both alias the same engine).
     OPENVINO_PREFIXES = ("openvino_int8:", "openvino:")
 
+    # Backend selector for the C++ ORT backend (mirrors benchmark's label).
+    ORT_CPP_PREFIX = "ort_cpp:"
+
     def __init__(self, model_path: str, device: str) -> None:
         spec = str(model_path)
+        self.device = (
+            "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
+        )
+        if spec.startswith(self.ORT_CPP_PREFIX):
+            # C++ backend: the model file is the part after the prefix; the exe
+            # is resolved lazily so a wrapper can be constructed without a
+            # built exe (e.g. the test suite) — only an actual forward call
+            # resolves it and may raise the "build it first" error.
+            self.type = "ort_cpp"
+            self.path = spec[len(self.ORT_CPP_PREFIX):]
+            self.model_path = self.path
+            self.model = None
+            self._exe = None
+            return
         self.openvino_backend: Optional[str] = None
         for prefix in self.OPENVINO_PREFIXES:
             if spec.startswith(prefix):
@@ -142,9 +176,6 @@ class ModelWrapper:
         # must keep the empty stripped path — falling back to the prefixed
         # spec would put the prefix back into every downstream path check.
         self.path = spec if self.openvino_backend is None else self.openvino_backend
-        self.device = (
-            "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
-        )
         if self.openvino_backend is not None:
             self.type = "openvino"
         else:
@@ -217,7 +248,18 @@ class ModelWrapper:
             logger.exception("Model load failed [%s]: %s", self.type, self.path)
             raise RuntimeError(f"Cannot load model {self.path}") from e
 
-    def forward(self, x: torch.Tensor) -> np.ndarray:
+    def forward(
+        self, x: torch.Tensor, paths: Optional[List] = None,
+        imgsz: Optional[int] = None,
+    ) -> np.ndarray:
+        """Run a forward pass and return the raw pre-NMS output as numpy.
+
+        ``paths`` and ``imgsz`` are only used by the ``ort_cpp`` backend (it
+        re-preprocesses from the image files); the other backends consume the
+        already-preprocessed tensor ``x`` and ignore them.
+        """
+        if self.type == "ort_cpp":
+            return self._forward_ort_cpp(paths or [], imgsz or 640)
         if self.type == "openvino":
             # OpenVINO consumes host numpy: the torch CUDA tensor is copied
             # to host before the forward (a --device cuda run with an
@@ -228,6 +270,79 @@ class ModelWrapper:
         if self.type == "pt":
             return pt_forward(self.model, x)
         return ort_forward(self.model, x, self.device)
+
+    def _forward_ort_cpp(self, paths: List, imgsz: int) -> np.ndarray:
+        """Shell out to ``ort_cpp --dump-raw-dir`` for the batch, return stacked
+        ``(bs, C, N)`` raw forward tensors.
+
+        One spawn per batch (the C++ side loads the session once per call).
+        Images are staged into a temp in-dir with zero-padded names so the
+        C++ ``--dir`` loader's sort order matches the batch order; outputs are
+        loaded back in sorted stem order. Suffixes outside
+        ``ORT_CPP_IMAGE_SUFFIXES`` are rejected at staging time (the same
+        contract as the benchmark's ``_run_ort_cpp`` — the C++ loader would
+        silently drop them). The C++ session's thread knobs come
+        from the same ``_thread_knobs()`` values the Python benchmark sessions
+        use; the Python comparison session itself is built without
+        ``SessionOptions`` (ORT defaults), so the two sides do not share one
+        operator-scheduling/reduction order (see docs/ORT_CPP.md).
+        """
+        if not paths:
+            raise RuntimeError("ort_cpp forward requires image paths")
+        for p in paths:
+            ext = Path(str(p)).suffix or ".jpg"
+            if ext.lower() not in ORT_CPP_IMAGE_SUFFIXES:
+                raise RuntimeError(
+                    f"ort_cpp backend requires .jpg/.jpeg/.png/.bmp images, "
+                    f"got '{ext}': {p}"
+                )
+        if self._exe is None:
+            self._exe = resolve_ort_cpp_exe()
+
+        n = len(paths)
+        width = max(6, len(str(n - 1)))
+        tmp_in = tempfile.mkdtemp(prefix="ort_cpp_cons_in_")
+        tmp_out = tempfile.mkdtemp(prefix="ort_cpp_cons_out_")
+        try:
+            for i, p in enumerate(paths):
+                ext = Path(str(p)).suffix or ".jpg"
+                shutil.copyfile(str(p), os.path.join(tmp_in, f"{i:0{width}d}{ext}"))
+
+            intra, inter = _thread_knobs()
+            cmd = [
+                self._exe,
+                "--dump-raw-dir", tmp_out,
+                "--dir", tmp_in,
+                "-m", self.model_path,
+                "--imgsz", str(imgsz),
+                "--intra-op-threads", str(intra),
+                "--inter-op-threads", str(inter),
+            ]
+            # Fixed 600 s timeout: a hung exe (stale build, deadlocked
+            # session) fails the run at the cap. The dump is one forward
+            # pass per staged image; the margin covers model load and
+            # first-run graph optimization.
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ort_cpp --dump-raw-dir failed (exit {proc.returncode}):\n"
+                    f"stderr: {proc.stderr[-2000:]}"
+                )
+
+            npys = sorted(Path(tmp_out).glob("*.npy"))
+            if len(npys) != n:
+                raise RuntimeError(
+                    f"ort_cpp produced {len(npys)} .npy files, expected {n}"
+                )
+            # Each .npy is (1, C, N); concatenate along axis 0 → (bs, C, N) to
+            # match the Python ort_forward output shape for the same batch.
+            outs = [np.load(str(p)) for p in npys]
+            return np.concatenate(outs, axis=0)
+        finally:
+            shutil.rmtree(tmp_in, ignore_errors=True)
+            shutil.rmtree(tmp_out, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -388,8 +503,11 @@ def validate_consistency(
                     )
                     x = pre["images"]
 
-                    out1 = model_obj1.forward(x)
-                    out2 = model_obj2.forward(x)
+                    # paths/imgsz only matter for the ort_cpp backend (it
+                    # re-preprocesses from the image files — the full-pipeline
+                    # comparison); the other backends ignore them.
+                    out1 = model_obj1.forward(x, paths=pre["paths"], imgsz=imgsz)
+                    out2 = model_obj2.forward(x, paths=pre["paths"], imgsz=imgsz)
 
                     stats = compare_tensors(
                         out1, out2, atol, rtol,
