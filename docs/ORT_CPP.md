@@ -211,3 +211,57 @@ output to `<out_dir>/<stem>.npy` — the input's stem with its extension strippe
 (little-endian float32, shape `(1, 4+nc, 8400)`).
 The npy writer is hand-rolled (no numpy dep on the C++ side). Requires `--dir`;
 ignores `--conf`/`--iou` (raw output is pre-NMS).
+
+## Recorded runs
+
+All figures below come from full recorded runs on the validated host
+(2026-10-26, WSL2, 13th Gen Intel Core i5-13420H, 12 logical cores):
+Python 3.12.3, ONNX Runtime 1.26.0, torch 2.6.0+cpu, imgsz 640, batch 1,
+images drawn from the COCO-subset val split (397 available). Thread knobs
+were intra=4 / inter=2 — a derived configuration (`_thread_knobs()` =
+`min(4, ncpu)` intra / `2` inter on this host), not a probed measurement —
+passed to the C++ exe in both runs. Scope note: in the consistency run this
+covers the `ort_cpp` side only; the Python comparison session is built
+without `SessionOptions` and uses ORT defaults (see
+[Harness integration](#harness-integration)).
+
+### Consistency (`models/yolov8s_fp32.onnx` vs `ort_cpp:models/yolov8s_fp32.onnx`)
+
+Tensor mode, strict pair (`--atol 1e-4 --rtol 1e-3`), 16 stratified-sampled
+val images, bs=1. Recorded command (only `--model1/--model2/--atol/--rtol/
+--max-images` are non-default):
+
+```bash
+python main.py consistency \
+    --model1 models/yolov8s_fp32.onnx \
+    --model2 ort_cpp:models/yolov8s_fp32.onnx \
+    --atol 1e-4 --rtol 1e-3 --max-images 16
+```
+
+| metric | value |
+| --- | --- |
+| fail_rate | 0.00% (0/16 batches) |
+| cosine_similarity_mean | 0.9999999999999907 |
+| mean_diff_mean | 3.83e-06 |
+| p95_mean / p99_mean | 3.05e-05 / 6.32e-05 |
+| max_diff_mean | 1.14e-03 |
+| std_diff_mean | 1.85e-05 |
+
+### Benchmark
+
+`--warmup 10 --runs 25 --max-images 16`. The two rows carry different timing
+protocols (see [Harness integration](#harness-integration)): the Python row
+times preprocess (including image decode) → forward → NMS per sweep; the
+`ort_cpp` row times `detect()` (preprocess + infer + postprocess + NMS) per
+iteration on pre-decoded images, with per-image numbers scaled to sweep units
+for the summary columns. Cross-protocol rows are indicative. The warmup differs per
+row too: `--warmup 10` covers the Python row, while the `ort_cpp` driver warms a fixed
+3 iterations before its timed loop. Percentiles are
+per-sweep (16 images); peak RSS is per protocol — the Python row reports the
+in-process delta from a pre-load baseline, the `ort_cpp` row reports the
+separate C++ process's absolute peak.
+
+| row | image_s | FPS | p50 (ms, sweep) | p95 | p99 | peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| `onnx_fp32` (Python, CPUExecutionProvider) | 0.193 | 5.17 | 2863.1 | 3241.1 | 3561.7 | 670.8 MB (Δ 213.6 MB) |
+| `ort_cpp` | 0.194 | 5.15 | 2761.5 | 2992.4 | 3092.0 | 203.8 MB (absolute) |
