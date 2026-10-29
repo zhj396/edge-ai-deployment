@@ -44,6 +44,12 @@ _LAZY: dict[str, str] = {
     "OpenVINOEngine": ".openvino_engine",
     "OpenVINOAsyncEngine": ".openvino_engine",
     "openvino_available": ".openvino_engine",
+    # TensorRT backend (optional — tensorrt/cuda-python not in the base pin set)
+    "TensorRTEngine": ".tensorrt_engine",
+    "tensorrt_available": ".tensorrt_engine",
+    "build_tensorrt_engine": ".tensorrt_build",
+    "export_tensorrt_ultralytics": ".tensorrt_build",
+    "trt_build_available": ".tensorrt_build",
 }
 
 __all__ = list(_LAZY)
