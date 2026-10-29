@@ -52,8 +52,8 @@ Key design rules:
   logic in CLI.
 * **Configs are typed.** Every command except `inspect` (two flat flags, no config object) has a
   `@dataclass` in `cli/schema.py` (`ExportConfig`,
-  `QuantizeConfig`, `InferConfig`, `BenchmarkConfig`, `ConsistencyConfig`, plus the three
-  OpenVINO subcommand configs), which provides typing,
+  `QuantizeConfig`, `InferConfig`, `BenchmarkConfig`, `ConsistencyConfig`, the three
+  OpenVINO subcommand configs, and the three TensorRT subcommand configs), which provides typing,
   validation, and a printable `repr()` for the log.
 * **Logging is centralized.** `utils.logging.setup_logging()` configures the root logger with a
   rotating file + stdout, idempotent under repeat calls; `get_logger(__name__)` everywhere.
@@ -482,10 +482,11 @@ mask a class-score divergence small enough to cross a `conf` cliff. With `conf_c
 `compare_tensors` additionally records the per-side above-cliff counts and directional flips
 (`above_cliff_1/2`, `cliff_promoted_1to2`, `cliff_demoted_1to2`) and fails tensor mode when the
 per-image flip count exceeds `cliff_count_thresh=5/img` — a gate alongside allclose. The
-consistency workflow calls `compare_tensors` without `nc` / `conf_cliff` (the class stats are
-inferred from the layout; the cliff fields are a library-caller option). The report carries the
-dual verdicts `tensor_gate_passed` (tensor gates) and `passed` (detection gates, authoritative in
-detection mode).
+consistency workflow passes the deployed conf threshold as `conf_cliff`, and the report carries
+the dual verdicts `allclose_passed` (raw-tensor parity) / `detection_consistent` (cliff clean) —
+a divergence within allclose tolerance that flips boxes across the cliff fails even though
+allclose passes, and a reduced-precision pair (FP16/INT8) can fail allclose while detections
+stay consistent. See [docs/TENSORRT.md](TENSORRT.md) "Dual verdict" for the full description.
 
 Plus NaN guard, shape-mismatch guard, and an `error_msg` for triage.
 
