@@ -269,12 +269,21 @@ If a default path changes, update it in this central location.
 
 ### 12. Consistency tolerance auto-selection
 
-This invariant lands together with the tolerance auto-selector
-(`consistency_tol`), a later deploy-half milestone: the strict pair
-(atol 1e-4 / rtol 1e-3) for PT↔FP32 and the loose pair (1e-3 / 1e-2) for
-INT8/FP16 pairs, selected from the model-pair stems, with explicit
-`--atol/--rtol` overriding. Until then the consistency CLI defaults to the
-loose pair and PT↔FP32 runs pass the strict pair explicitly
+The consistency CLI auto-selects the tolerance pair from the model-pair
+stems via `utils/comparison.py::select_tolerance_pair` (a pure helper under
+the invariant-7 charter): the strict pair (atol 1e-4 / rtol 1e-3) when
+*both* sides look full-precision — suffix in `{.pt, .pth, .onnx}` with no
+reduced-precision marker (`int8`/`int4`/`fp16`/`f16`/`half`/`quant`) in the
+stem or backend prefix — and the loose pair (1e-3 / 1e-2) otherwise
+(`.xml` / `.engine` artifacts and any marked stem are never strict).
+Explicit `--atol/--rtol` override per-flag; an omitted flag falls back to
+the auto-selected pair's value (an explicit loose `--atol` on an INT8 pair
+is not paired with the strict `rtol`). The resolved pair and its source
+(`auto-strict` / `auto-loose` / `explicit-atol` / `explicit-rtol` /
+`explicit`) are recorded under `tolerances` in the JSON report. The
+library-level `validate_consistency` defaults (strict) are unchanged — the
+selector is CLI policy. Explicit flags remain the escape hatch for pairs
+the rule classifies loose (e.g. a `--no-fp16` OpenVINO IR against PT)
 (see [docs/ARCHITECTURE.md §7.1](docs/ARCHITECTURE.md#71-two-models-two-modes)).
 
 ### 13. Calibration sampling must be deterministic across processes

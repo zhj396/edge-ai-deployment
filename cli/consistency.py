@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from utils import existing_validation, get_logger
+from utils.comparison import select_tolerance_pair
 from . import (
     ConsistencyConfig,
     DEFAULT_DATA_DIR,
@@ -85,16 +86,21 @@ def add_parser(subparsers):
              "the sampler, and preprocessing then run on CPU; 'cuda' is "
              "the setting that runs the reference model on GPU.",
     )
-    # Default 1e-3 / 1e-2 covers both PT↔ONNX-FP32 and FP32↔INT8: in detection
-    # mode the tensor stats are advisory. For PT↔FP32 tensor runs pass
-    # --atol 1e-4 --rtol 1e-3.
+    # default=None defers to the tolerance auto-selector in run(): the pair
+    # is picked from the model-pair stems (strict 1e-4/1e-3 for PT<->FP32,
+    # loose 1e-3/1e-2 for INT8/FP16), and an explicit flag overrides its
+    # half of the pair.
     parser.add_argument(
-        "--atol", type=float, default=1e-3,
-        help="Absolute tolerance (default: 1e-3 — works for both PT↔FP32 and FP32↔INT8)",
+        "--atol", type=float, default=None,
+        help="Absolute tolerance. Omit to auto-select from the model pair: "
+             "1e-4 (strict, PT↔FP32) or 1e-3 (loose, INT8/FP16). An explicit "
+             "value overrides the auto-selected atol.",
     )
     parser.add_argument(
-        "--rtol", type=float, default=1e-2,
-        help="Relative tolerance (default: 1e-2 — works for both PT↔FP32 and FP32↔INT8)",
+        "--rtol", type=float, default=None,
+        help="Relative tolerance. Omit to auto-select from the model pair: "
+             "1e-3 (strict) or 1e-2 (loose). An explicit value overrides the "
+             "auto-selected rtol.",
     )
     parser.add_argument(
         "--report-path", type=Path, default="results/consistency_report.json",
@@ -129,9 +135,29 @@ def run(args):
     report_path = args.report_path.with_name(
         f"{args.report_path.stem}{ts}{args.report_path.suffix}"
     )
+    # Tolerance auto-selection (CLAUDE.md invariant 12): the pair is picked
+    # from the model-pair stems; an explicit flag overrides its half of the
+    # pair — an omitted flag falls back to the auto-selected value, so an
+    # explicit loose --atol on an INT8 pair is not paired with the strict
+    # rtol. The resolved pair and its source are logged and recorded in the
+    # report (``tolerances``).
+    model1 = _resolve_consistency_model(args.model1, DEFAULT_MODEL_PT)
+    model2 = _resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32)
+    level, auto_atol, auto_rtol = select_tolerance_pair(model1, model2)
+    if args.atol is None and args.rtol is None:
+        atol, rtol, tolerance_source = auto_atol, auto_rtol, f"auto-{level}"
+    elif args.rtol is None:
+        atol, rtol, tolerance_source = args.atol, auto_rtol, "explicit-atol"
+    elif args.atol is None:
+        atol, rtol, tolerance_source = auto_atol, args.rtol, "explicit-rtol"
+    else:
+        atol, rtol, tolerance_source = args.atol, args.rtol, "explicit"
+    logger.info(
+        "Tolerances: atol=%g rtol=%g (%s)", atol, rtol, tolerance_source
+    )
     cfg = ConsistencyConfig(
-        model1=_resolve_consistency_model(args.model1, DEFAULT_MODEL_PT),
-        model2=_resolve_consistency_model(args.model2, DEFAULT_MODEL_FP32),
+        model1=model1,
+        model2=model2,
         imgs_input=(args.imgs_input if args.imgs_input is not None
                     else existing_validation(DEFAULT_DATA_DIR)),
         mode=args.mode,
@@ -140,8 +166,8 @@ def run(args):
         batch_sizes=args.batch_sizes,
         resnet50=args.resnet50,
         device=args.device,
-        atol=args.atol,
-        rtol=args.rtol,
+        atol=atol,
+        rtol=rtol,
         report_path=report_path,
     )
     # Log the full model spec (not Path.name): for prefixed specs the
@@ -161,6 +187,7 @@ def run(args):
         device=cfg.device,
         atol=cfg.atol,
         rtol=cfg.rtol,
+        tolerance_source=tolerance_source,
         report_path=cfg.report_path,
     )
     logger.info("Consistency report: %s", report_path)

@@ -6,11 +6,81 @@ helpers belong here.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tolerance selection
+# ---------------------------------------------------------------------------
+# The strict pair catches export bugs / dtype drift on full-precision pairs
+# (PT <-> ONNX FP32); the loose pair absorbs reduced-precision noise
+# (INT8 / FP16). See CLAUDE.md invariant 12.
+TOLERANCE_PAIRS: Dict[str, Tuple[float, float]] = {
+    "strict": (1e-4, 1e-3),
+    "loose": (1e-3, 1e-2),
+}
+
+# Stem / backend-prefix markers that classify a side as reduced precision.
+REDUCED_PRECISION_MARKERS = ("int8", "int4", "fp16", "f16", "half", "quant")
+# The backend prefixes ModelWrapper parses (mirror of the class constants in
+# src/consistency.py — kept as a literal so this module stays import-light).
+_BACKEND_PREFIXES = ("openvino_int8:", "openvino:", "ort_cpp:", "tensorrt:")
+# Suffixes a full-precision artifact can carry. .xml (OpenVINO IR — FP16 by
+# default at convert time) and .engine (TensorRT) are deliberately absent.
+_FULL_PRECISION_SUFFIXES = (".pt", ".pth", ".onnx")
+
+
+def _strip_backend_prefix(spec: str) -> Tuple[str, str]:
+    """Split a ``backend:path`` spec into ``(prefix, path)``; a plain path
+    yields ``("", spec)``."""
+    spec = str(spec)
+    for prefix in _BACKEND_PREFIXES:
+        if spec.startswith(prefix):
+            return prefix, spec[len(prefix):]
+    return "", spec
+
+
+def _side_is_full_precision(spec: str) -> bool:
+    """True iff one model spec looks full-precision, from its text alone.
+
+    All three must hold: the backend prefix carries no reduced-precision
+    marker; the path suffix is in the full-precision allowlist; the path
+    stem (not the directories — a dataset dir named ``int8_set/`` must not
+    misclassify) carries no marker. Marker scan over ``prefix + stem`` also
+    classifies precision-labeled prefixes (``openvino_int8:``) without a
+    special case.
+    """
+    prefix, path = _strip_backend_prefix(spec)
+    if any(m in prefix.lower() for m in REDUCED_PRECISION_MARKERS):
+        return False
+    if not path.lower().endswith(_FULL_PRECISION_SUFFIXES):
+        return False
+    stem = Path(path).stem.lower()
+    return not any(m in stem for m in REDUCED_PRECISION_MARKERS)
+
+
+def select_tolerance_pair(model1_spec: str, model2_spec: str) -> Tuple[str, float, float]:
+    """Pick the consistency tolerance pair from the model-pair stems.
+
+    Returns ``(level, atol, rtol)``: the strict pair (atol 1e-4 / rtol
+    1e-3) when *both* sides look full-precision, the loose pair (1e-3 /
+    1e-2) otherwise. Symmetric by construction — swapping the two specs
+    cannot change the result. An unmarked ``.onnx`` pairs strict (the
+    repo's FP32 exports are named ``*_fp32.onnx``; ``fp32`` matches no
+    marker). Deterministic: pure string classification, no I/O.
+    """
+    level = (
+        "strict"
+        if _side_is_full_precision(model1_spec) and _side_is_full_precision(model2_spec)
+        else "loose"
+    )
+    atol, rtol = TOLERANCE_PAIRS[level]
+    return level, atol, rtol
 
 
 # ---------------------------------------------------------------------------
@@ -330,4 +400,7 @@ __all__ = [
     "compare_tensors",
     "compute_iou",
     "compare_detections",
+    "select_tolerance_pair",
+    "TOLERANCE_PAIRS",
+    "REDUCED_PRECISION_MARKERS",
 ]

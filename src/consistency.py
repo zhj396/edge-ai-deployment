@@ -56,6 +56,9 @@ from utils.comparison import (  # noqa: F401  (re-exports — see comment above)
     compute_iou,
     _match_predictions_to_gt,
     compare_detections,
+    select_tolerance_pair,
+    TOLERANCE_PAIRS,
+    REDUCED_PRECISION_MARKERS,
 )
 from . import post_process, preprocess_imgs
 
@@ -477,6 +480,7 @@ def validate_consistency(
     iou_thres: float = 0.45,
     atol: float = 1e-4,
     rtol: float = 1e-3,
+    tolerance_source: Optional[str] = None,
     cosine_similarity_thresh: float = 0.995,
     mean_diff_thresh: float = 0.01,
     p99_thresh: float = 0.05,
@@ -497,6 +501,11 @@ def validate_consistency(
     ---------
     1. PyTorch (.pt) vs ONNX FP32 — ``mode="tensor"``
     2. ONNX FP32 vs ONNX INT8 — ``mode="detection"``
+
+    ``tolerance_source`` is recorded in the report (informational): the CLI
+    passes how the atol/rtol pair was chosen (``auto-strict`` /
+    ``auto-loose`` when auto-selected from the model pair, ``explicit*``
+    when flags overrode). Direct callers may omit it.
     """
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -783,6 +792,13 @@ def validate_consistency(
 
     overall_pass = all(r["overall_status"] == "PASS" for r in results)
     final_result = {"results": results, "overall_pass": overall_pass, "mode": mode}
+    # Record the tolerance pair the verdict was reached at — a FAIL report
+    # must be replayable at the same tolerances. ``tolerance_source`` (CLI
+    # wiring) names how the pair was chosen: auto-strict / auto-loose /
+    # explicit-atol / explicit-rtol / explicit.
+    final_result["tolerances"] = {"atol": atol, "rtol": rtol}
+    if tolerance_source is not None:
+        final_result["tolerances"]["source"] = tolerance_source
     if openvino_provenance:
         final_result["openvino_devices"] = openvino_provenance
     # Final dump supersedes the last incremental write with the complete

@@ -442,8 +442,9 @@ caching is opt-in for library callers.)
    │ model A: PT (.pt)  │─────────▶│ model B: ONNX FP32 │
    └────────────────────┘          └────────────────────┘
        strict tolerance: np.testing.assert_allclose
-       (PT<->FP32 runs pass --atol 1e-4 --rtol 1e-3; the CLI default
-       1e-3 / 1e-2 is the loose pair for INT8 comparisons)
+       (the CLI auto-selects the strict pair for full-precision pairs and
+       the loose 1e-3 / 1e-2 pair for INT8/FP16 pairs; explicit --atol/--rtol
+       override — CLAUDE.md §12)
        catches: export bugs, dtype drift, graph rewrite errors
 
    ┌────────────────────┐  detection  ┌────────────────────┐
