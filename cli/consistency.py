@@ -16,14 +16,17 @@ logger = get_logger(__name__)
 def _resolve_consistency_model(arg, default):
     """Resolve a --model1/--model2 arg, allowing a backend prefix.
 
-    A prefixed spec (``ort_cpp:<onnx>`` / ``openvino(_int8):<xml>``) is a
-    backend selector, not a path — pass it through verbatim;
-    ``ModelWrapper`` parses the prefix (ort_cpp resolves its exe lazily on
-    the first forward; openvino(_int8) loads the .xml at construction). A
-    plain value is passed through unchanged; the existing-validated default
-    applies only when the flag is omitted.
+    A prefixed spec (``ort_cpp:<onnx>`` / ``tensorrt:<engine>`` /
+    ``openvino(_int8):<xml>``) is a backend selector, not a path — pass it
+    through verbatim; ``ModelWrapper`` parses the prefix. ort_cpp/tensorrt
+    resolve their engine lazily on the first forward; openvino(_int8)
+    path-checks the .xml at construction. A plain value is passed through
+    unchanged; the existing-validated default applies only when the flag is
+    omitted.
     """
-    if arg and str(arg).startswith(("ort_cpp:", "openvino:", "openvino_int8:")):
+    if arg and str(arg).startswith(
+        ("ort_cpp:", "tensorrt:", "openvino:", "openvino_int8:")
+    ):
         return arg
     return arg if arg is not None else existing_validation(default)
 
@@ -47,14 +50,18 @@ def add_parser(subparsers):
         "--model1", type=str, default=None,
         help=f"Reference model (default: {DEFAULT_MODEL_PT}). Prefix "
         f"'ort_cpp:' for the C++ backend (requires the built ort_cpp exe; "
-        f"see docs/ORT_CPP.md), or 'openvino:' / 'openvino_int8:' to compare "
-        f"an OpenVINO IR, e.g. 'openvino_int8:models/yolov8s_openvino_int8.xml' "
+        f"see docs/ORT_CPP.md), 'tensorrt:' to compare a serialized .engine "
+        f"via the TensorRT backend, e.g. "
+        f"'tensorrt:models/yolov8s_fp16.engine'. Prefix 'openvino:' or "
+        f"'openvino_int8:' to compare an OpenVINO IR, e.g. "
+        f"'openvino_int8:models/yolov8s_openvino_int8.xml' "
         f"(OPENVINO_DEVICE env var selects CPU/GPU/AUTO).",
     )
     parser.add_argument(
         "--model2", type=str, default=None,
         help=f"Comparison model (default: {DEFAULT_MODEL_FP32}). Accepts the "
-        f"'ort_cpp:', 'openvino:' and 'openvino_int8:' prefixes like --model1.",
+        f"'ort_cpp:', 'tensorrt:', 'openvino:' and 'openvino_int8:' prefixes "
+        f"like --model1.",
     )
     parser.add_argument(
         "--imgs-input", type=Path, default=None,
@@ -69,8 +76,14 @@ def add_parser(subparsers):
         help="Optional local ResNet50 checkpoint (default: torchvision auto-download)",
     )
     parser.add_argument(
-        "--device", type=str, default="cpu", choices=["cpu", "cuda"],
-        help="Validation device (default: cpu)",
+        "--device", type=str, default="cpu",
+        help="Validation device: 'cpu', 'cuda', or a numeric GPU id "
+             "(default: cpu). A numeric id selects the GPU the TensorRT "
+             "engine runs on when a 'tensorrt:' model spec is used "
+             "(e.g. --device 1); 'cpu'/'cuda' map to GPU 0 there. A numeric "
+             "id affects the TensorRT engine only — the reference model, "
+             "the sampler, and preprocessing then run on CPU; 'cuda' is "
+             "the setting that runs the reference model on GPU.",
     )
     # Default 1e-3 / 1e-2 covers both PT↔ONNX-FP32 and FP32↔INT8: in detection
     # mode the tensor stats are advisory. For PT↔FP32 tensor runs pass
@@ -102,6 +115,12 @@ def add_parser(subparsers):
 # Run consistency validation command
 # =========================================================
 def run(args):
+    device = str(args.device)
+    if device != "cpu" and device != "cuda" and not device.isdigit():
+        raise ValueError(
+            f"Invalid --device {args.device!r}: use 'cpu', 'cuda', or a "
+            "numeric GPU id."
+        )
     # One timestamp per run (see cli.run_timestamp for the format rationale).
     # Insert <ts> between stem and suffix so the file is ``<stem>_<TS>.json``
     # — the documented format and the fail_dir name-replace derivation in

@@ -35,6 +35,10 @@ def add_parser(subparsers):
             "--model onnx_int8:models/yolov8s_int8.onnx "
             "--model ort_cpp:models/yolov8s_fp32.onnx "
             "(requires the built ort_cpp exe; see docs/ORT_CPP.md) "
+            "--model tensorrt_fp16:models/yolov8s_fp16.engine "
+            "--model tensorrt_int8:models/yolov8s_int8.engine "
+            "(requires the .engine built via `python main.py tensorrt build`; "
+            "see docs/TENSORRT.md; GPU id via the TENSORRT_DEVICE env var) "
             "--model openvino:models/yolov8s_openvino.xml "
             "--model openvino_int8:models/yolov8s_openvino_int8.xml "
             "(openvino device is selected via the OPENVINO_DEVICE env var)"
@@ -81,7 +85,18 @@ def add_parser(subparsers):
 # =========================================================
 # Run benchmark command
 # =========================================================
+def _validate_counts(args):
+    """Reject non-positive --runs / negative --warmup before any work starts
+    (the aggregator itself raises on an empty timed loop; failing here keeps
+    the error at argument level)."""
+    if args.runs < 1:
+        raise SystemExit(f"--runs must be >= 1 (got {args.runs})")
+    if args.warmup < 0:
+        raise SystemExit(f"--warmup must be >= 0 (got {args.warmup})")
+
+
 def run(args):
+    _validate_counts(args)
     model_dict: Dict[str, str] = {}
     if args.model:
         for item in args.model:
@@ -93,15 +108,23 @@ def run(args):
             path = path.strip()
 
             if backend not in ["pytorch", "onnx_fp32", "onnx_int8", "ort_cpp",
-                               "openvino", "openvino_int8"]:
+                               "openvino", "openvino_int8",
+                               "tensorrt", "tensorrt_fp16", "tensorrt_int8"]:
                 # A bare Windows path ("C:\models\x.onnx") partitions into
-                # backend="C"; give it the generic invalid-format error.
+                # backend="C", which falls through to the generic
+                # invalid-format message.
                 if len(backend) == 1 and path.startswith(("\\", "/")):
                     raise ValueError(
                         f"Invalid model format. Expected 'backend:path', got: {item}"
                     )
                 raise ValueError(f"Unsupported backend: {backend}")
 
+            if backend in model_dict:
+                raise ValueError(
+                    f"Duplicate --model backend {backend!r} "
+                    f"({model_dict[backend]!r} and {path!r}); pass each "
+                    "backend once"
+                )
             model_dict[backend] = path
 
     if not model_dict:

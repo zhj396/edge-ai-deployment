@@ -119,11 +119,36 @@ def ort_forward(
     return session.run(None, {input_name: ort_input})[0]
 
 
+def trt_forward_capped(engine, x_np: np.ndarray) -> np.ndarray:
+    """Run one TensorRT forward, sub-looping when the batch exceeds the
+    engine's per-forward bound.
+
+    ``TensorRTEngine._forward`` raises for a batch above ``max_batch``
+    (the serialized optimization-profile max), and the consistency harness
+    feeds whole preprocessed batches straight through, so the count is
+    capped via ``_effective_batch`` and the chunks' raw outputs are
+    concatenated in input order (the head layout ``[bs, 4+nc, N]`` stacks
+    on axis 0). ``raw_forward`` returns a view of the engine's reused host
+    output buffer, so each chunk is copied before the next forward
+    overwrites that buffer.
+    """
+    bs = int(x_np.shape[0])
+    eff = engine._effective_batch(bs)
+    if eff >= bs:
+        return engine.raw_forward(x_np)
+    outs = [
+        np.array(engine.raw_forward(x_np[i: i + eff]))
+        for i in range(0, bs, eff)
+    ]
+    return np.concatenate(outs, axis=0)
+
+
 # ---------------------------------------------------------------------------
 # Unified model wrapper
 # ---------------------------------------------------------------------------
 class ModelWrapper:
-    """Unified interface for PyTorch, ONNX, OpenVINO, and ORT-C++ models.
+    """Unified interface for PyTorch, ONNX, OpenVINO, ORT-C++, and TensorRT
+    models.
 
     ``model_path`` additionally accepts a ``backend:path`` spec:
     ``openvino:models/yolov8s_openvino.xml`` or ``openvino_int8:models/...
@@ -140,6 +165,11 @@ class ModelWrapper:
     (``cpp/common/letterbox.cpp``) is exercised alongside the forward, so the
     comparison validates the C++ mirror of the Python preprocess+forward
     end-to-end.
+
+    A ``tensorrt:<engine_path>`` prefix selects the TensorRT backend: the
+    ``.engine`` is deserialized lazily on the first forward (no in-process
+    engine at construction); ``forward`` runs the pre-NMS raw output through
+    :meth:`TensorRTEngine.raw_forward`.
     """
 
     # Prefixes that route to OpenVINOEngine (both alias the same engine).
@@ -148,11 +178,25 @@ class ModelWrapper:
     # Backend selector for the C++ ORT backend (mirrors benchmark's label).
     ORT_CPP_PREFIX = "ort_cpp:"
 
+    # Backend selector for the TensorRT backend (mirrors benchmark's label).
+    TENSORRT_PREFIX = "tensorrt:"
+
     def __init__(self, model_path: str, device: str) -> None:
         spec = str(model_path)
         self.device = (
             "cuda" if device == "cuda" and torch.cuda.is_available() else "cpu"
         )
+        # TRT engine GPU id: a numeric --device (e.g. "1") selects that GPU for
+        # the TensorRTEngine; "cpu"/"cuda" -> GPU 0 (the TRT engine always runs
+        # on GPU). Stored separately from self.device (the "cpu"/"cuda" mode the
+        # ORT reference + preprocess use) so those paths are unchanged by a
+        # numeric --device.
+        if isinstance(device, int) and not isinstance(device, bool):
+            self._trt_gpu_id = device
+        elif isinstance(device, str) and device.isdigit():
+            self._trt_gpu_id = int(device)
+        else:
+            self._trt_gpu_id = 0
         if spec.startswith(self.ORT_CPP_PREFIX):
             # C++ backend: the model file is the part after the prefix; the exe
             # is resolved lazily so a wrapper can be constructed without a
@@ -163,6 +207,16 @@ class ModelWrapper:
             self.model_path = self.path
             self.model = None
             self._exe = None
+            return
+        if spec.startswith(self.TENSORRT_PREFIX):
+            # TensorRT backend: the engine is deserialized lazily on the first
+            # forward call (the same lazy contract as ort_cpp:) — constructing
+            # the wrapper without TRT installed / without the .engine staged
+            # does not fail; only an actual forward call resolves it.
+            self.type = "tensorrt"
+            self.path = spec[len(self.TENSORRT_PREFIX):]
+            self.model_path = self.path
+            self.model = None
             return
         self.openvino_backend: Optional[str] = None
         for prefix in self.OPENVINO_PREFIXES:
@@ -223,15 +277,16 @@ class ModelWrapper:
             raise FileNotFoundError(f"Model file not found: {self.path}")
 
         # Suffix gate: existing_validation accepts .xml/.bin for the openvino
-        # command group, so a mispointed --model1/--model2 can reach this
-        # wrapper with a suffix its loader cannot read. Reject it ahead of
-        # the YOLO()/ORT load, with the owning prefix named — the openvino:
-        # prefixes above are the only consumers of those suffixes.
+        # command group and .engine for the tensorrt command group, so a
+        # mispointed --model1/--model2 can reach this wrapper with a suffix
+        # its loader cannot read. Reject it ahead of the YOLO()/ORT load,
+        # with the owning prefix named.
         if Path(self.path).suffix.lower() not in (".pt", ".pth", ".onnx"):
             raise PathValidationError(
                 f"consistency expects a .pt/.pth checkpoint or an ONNX file, "
                 f"got: {self.path}. OpenVINO IR files (.xml/.bin) are served "
-                f"through the openvino:/openvino_int8: prefixes."
+                f"through the openvino:/openvino_int8: prefixes, TensorRT "
+                f"engines (.engine) through the tensorrt: prefix."
             )
 
         try:
@@ -254,12 +309,31 @@ class ModelWrapper:
     ) -> np.ndarray:
         """Run a forward pass and return the raw pre-NMS output as numpy.
 
-        ``paths`` and ``imgsz`` are only used by the ``ort_cpp`` backend (it
-        re-preprocesses from the image files); the other backends consume the
-        already-preprocessed tensor ``x`` and ignore them.
+        ``paths`` is only used by the ``ort_cpp`` backend (it re-preprocesses
+        from the image files); ``imgsz`` sizes the ort_cpp re-preprocess and
+        the TensorRT engine construction. The other backends consume the
+        already-preprocessed tensor ``x`` and ignore both.
         """
         if self.type == "ort_cpp":
             return self._forward_ort_cpp(paths or [], imgsz or 640)
+        if self.type == "tensorrt":
+            # Deserialize the .engine on first forward, then reuse. TRT
+            # consumes the already-preprocessed tensor ``x`` like the onnx
+            # path.
+            if self.model is None:
+                from . import TensorRTEngine, tensorrt_available
+                if not tensorrt_available():
+                    raise ImportError(
+                        "tensorrt is not installed. Run: "
+                        "pip install -r requirements-tensorrt.txt"
+                    )
+                self.model = TensorRTEngine(
+                    model_path=self.model_path, device=self._trt_gpu_id,
+                    imgsz=imgsz or 640,
+                )
+            # _forward raises above the engine's max_batch: the batch is
+            # capped at that count and sub-looped here.
+            return trt_forward_capped(self.model, x.detach().cpu().numpy())
         if self.type == "openvino":
             # OpenVINO consumes host numpy: the torch CUDA tensor is copied
             # to host before the forward (a --device cuda run with an
@@ -270,6 +344,23 @@ class ModelWrapper:
         if self.type == "pt":
             return pt_forward(self.model, x)
         return ort_forward(self.model, x, self.device)
+
+    def release(self) -> None:
+        """Release backend resources that need explicit teardown.
+
+        Only the TensorRT backend holds one — the lazily deserialized
+        ``.engine`` (its stream, device buffers, and the retained primary
+        context), torn down through the engine's idempotent ``release()``.
+        Safe on a wrapper that never ran a forward (``model`` is still
+        ``None``) and on every other backend: the PT / ONNX / ort_cpp
+        resources release through GC or process exit, and OpenVINO holds no
+        explicit device handles.
+        """
+        if self.type == "tensorrt" and self.model is not None:
+            release = getattr(self.model, "release", None)
+            if callable(release):
+                release()
+            self.model = None
 
     def _forward_ort_cpp(self, paths: List, imgsz: int) -> np.ndarray:
         """Shell out to ``ort_cpp --dump-raw-dir`` for the batch, return stacked
@@ -487,152 +578,208 @@ def validate_consistency(
     if copy_failed_samples:
         fail_dir.mkdir(parents=True, exist_ok=True)
 
-    for imgsz in img_sizes:
-        for bs in batch_sizes:
-            logger.info("\nTest config: imgsz=%d, batch=%d", imgsz, bs)
-            batch_results: List[Dict] = []
-            failures = 0
+    try:
+        for imgsz in img_sizes:
+            for bs in batch_sizes:
+                logger.info("\nTest config: imgsz=%d, batch=%d", imgsz, bs)
+                batch_results: List[Dict] = []
+                failures = 0
+                detection_failures = 0
 
-            iterator = range(0, len(imgs), bs)
-            for i in tqdm(iterator, desc=f"bs={bs}"):
-                batch_paths = imgs[i : i + bs]
-                try:
-                    pre = preprocess_imgs(
-                        batch_paths, imgsz=imgsz,
-                        device=device, num_workers=num_workers,
-                    )
-                    x = pre["images"]
+                iterator = range(0, len(imgs), bs)
+                for i in tqdm(iterator, desc=f"bs={bs}"):
+                    batch_paths = imgs[i : i + bs]
+                    try:
+                        pre = preprocess_imgs(
+                            batch_paths, imgsz=imgsz,
+                            device=device, num_workers=num_workers,
+                        )
+                        x = pre["images"]
 
-                    # paths/imgsz only matter for the ort_cpp backend (it
-                    # re-preprocesses from the image files — the full-pipeline
-                    # comparison); the other backends ignore them.
-                    out1 = model_obj1.forward(x, paths=pre["paths"], imgsz=imgsz)
-                    out2 = model_obj2.forward(x, paths=pre["paths"], imgsz=imgsz)
+                        # paths/imgsz only matter for the ort_cpp backend (it
+                        # re-preprocesses from the image files — the full-pipeline
+                        # comparison); the other backends ignore them.
+                        out1 = model_obj1.forward(x, paths=pre["paths"], imgsz=imgsz)
+                        out2 = model_obj2.forward(x, paths=pre["paths"], imgsz=imgsz)
 
-                    stats = compare_tensors(
-                        out1, out2, atol, rtol,
-                        cosine_similarity_thresh, mean_diff_thresh,
-                        p99_thresh, mode,
-                    )
-                    stats.update({
-                        "imgsz": imgsz,
-                        "batch_size": len(batch_paths),
-                        "mode": mode,
-                    })
-
-                    if mode == "detection":
-                        dets1 = post_process(
-                            out1, orig_shapes=pre["orig_shapes"],
-                            conf_thres=conf_thres, iou_thres=iou_thres,
-                            imgsz=imgsz,
-                            ratios=pre.get("ratios"), pads=pre.get("pads"),
+                        stats = compare_tensors(
+                            out1, out2, atol, rtol,
+                            cosine_similarity_thresh, mean_diff_thresh,
+                            p99_thresh, mode,
+                            # Use the deployed conf threshold as the conf-cliff for
+                            # per-side surviving-box counts (tensor mode).
+                            conf_cliff=conf_thres,
+                            # Explicit nc (resolved from data.yaml above) keeps
+                            # the class-channel split and the cliff gate exact
+                            # on non-validated head layouts too — the same
+                            # contract the post_process calls follow.
                             nc=num_classes,
                         )
-                        dets2 = post_process(
-                            out2, orig_shapes=pre["orig_shapes"],
-                            conf_thres=conf_thres, iou_thres=iou_thres,
-                            imgsz=imgsz,
-                            ratios=pre.get("ratios"), pads=pre.get("pads"),
-                            nc=num_classes,
-                        )
+                        stats.update({
+                            "imgsz": imgsz,
+                            # Actual batch fed to both models: preprocess_imgs drops
+                            # unreadable images, so this can be < len(batch_paths).
+                            "batch_size": len(pre["paths"]),
+                            "mode": mode,
+                        })
 
-                        per_image = []
-                        for d1, d2, p in zip(dets1, dets2, pre["paths"]):
-                            ds = compare_detections(
-                                d1, d2, det_iou_thresh, mean_iou_thresh,
-                                class_match_thresh, score_diff_thresh,
-                                count_diff_thresh, recall_match_thresh,
+                        if mode == "detection":
+                            dets1 = post_process(
+                                out1, orig_shapes=pre["orig_shapes"],
+                                conf_thres=conf_thres, iou_thres=iou_thres,
+                                imgsz=imgsz,
+                                ratios=pre.get("ratios"), pads=pre.get("pads"),
+                                nc=num_classes,
                             )
-                            ds["image_path"] = str(p)
-                            per_image.append(ds)
+                            dets2 = post_process(
+                                out2, orig_shapes=pre["orig_shapes"],
+                                conf_thres=conf_thres, iou_thres=iou_thres,
+                                imgsz=imgsz,
+                                ratios=pre.get("ratios"), pads=pre.get("pads"),
+                                nc=num_classes,
+                            )
 
-                        if per_image:
-                            det_summary = {
-                                "det_passed": all(ds["passed"] for ds in per_image),
-                                "det_mean_iou": float(np.mean(
-                                    [ds["mean_iou"] for ds in per_image]
-                                )),
-                                "det_class_match_rate": float(np.mean(
-                                    [ds["class_match_rate"] for ds in per_image]
-                                )),
-                                "det_score_diff_mean": float(np.mean(
-                                    [ds["score_diff_mean"] for ds in per_image]
-                                )),
-                                "det_count_diff_mean": float(np.mean(
-                                    [ds["count_diff"] for ds in per_image]
-                                )),
-                            }
-                            stats.update(det_summary)
-                            stats["per_image_detection"] = per_image
-
-                            # In detection mode the per-image IoU/class/score gates
-                            # decide pass/fail; the tensor verdict (cosine /
-                            # mean_diff / p99 on the raw output) is informational.
-                            stats["tensor_gate_passed"] = bool(stats.get("passed", False))
-                            stats["passed"] = bool(det_summary["det_passed"])
-                            stats["status"] = "PASS" if stats["passed"] else "FAIL"
-
-                            if not det_summary["det_passed"]:
-                                logger.warning(
-                                    "Detection comparison failed (batch_size=%d)",
-                                    len(batch_paths),
+                            per_image = []
+                            for d1, d2, p in zip(dets1, dets2, pre["paths"]):
+                                ds = compare_detections(
+                                    d1, d2, det_iou_thresh, mean_iou_thresh,
+                                    class_match_thresh, score_diff_thresh,
+                                    count_diff_thresh, recall_match_thresh,
                                 )
-                                for ds in (d for d in per_image if not d["passed"]):
+                                ds["image_path"] = str(p)
+                                per_image.append(ds)
+
+                            if per_image:
+                                det_summary = {
+                                    "det_passed": all(ds["passed"] for ds in per_image),
+                                    "det_mean_iou": float(np.mean(
+                                        [ds["mean_iou"] for ds in per_image]
+                                    )),
+                                    "det_class_match_rate": float(np.mean(
+                                        [ds["class_match_rate"] for ds in per_image]
+                                    )),
+                                    "det_score_diff_mean": float(np.mean(
+                                        [ds["score_diff_mean"] for ds in per_image]
+                                    )),
+                                    "det_count_diff_mean": float(np.mean(
+                                        [ds["count_diff"] for ds in per_image]
+                                    )),
+                                }
+                                stats.update(det_summary)
+                                stats["per_image_detection"] = per_image
+
+                                # In detection mode the per-image IoU/class/score gates
+                                # decide pass/fail; the tensor verdict (cosine /
+                                # mean_diff / p99 on the raw output) is informational.
+                                stats["tensor_gate_passed"] = bool(stats.get("passed", False))
+                                stats["passed"] = bool(det_summary["det_passed"])
+                                stats["status"] = "PASS" if stats["passed"] else "FAIL"
+
+                                if not det_summary["det_passed"]:
                                     logger.warning(
-                                        "%s | IoU=%.4f | Class=%.3f | "
-                                        "ScoreDiff=%.4f | CountDiff=%d",
-                                        Path(ds["image_path"]).name,
-                                        ds["mean_iou"], ds["class_match_rate"],
-                                        ds["score_diff_mean"], ds["count_diff"],
+                                        "Detection comparison failed (batch_size=%d)",
+                                        len(pre["paths"]),
                                     )
+                                    for ds in (d for d in per_image if not d["passed"]):
+                                        logger.warning(
+                                            "%s | IoU=%.4f | Class=%.3f | "
+                                            "ScoreDiff=%.4f | CountDiff=%d",
+                                            Path(ds["image_path"]).name,
+                                            ds["mean_iou"], ds["class_match_rate"],
+                                            ds["score_diff_mean"], ds["count_diff"],
+                                        )
 
-                    batch_results.append(stats)
+                        batch_results.append(stats)
 
-                    if not stats["passed"]:
+                        if not stats["passed"]:
+                            failures += 1
+                            # Detection-level verdict — present only in tensor mode
+                            # (compare_tensors sets ``detection_consistent`` when the
+                            # conf-cliff gate ran).
+                            det_c = stats.get("detection_consistent")
+                            if det_c is False:
+                                detection_failures += 1
+                            if "above_cliff_1" in stats:
+                                cliff = (
+                                    f" | above_cliff {stats.get('above_cliff_1')}→"
+                                    f"{stats.get('above_cliff_2')} "
+                                    f"(promoted={stats.get('cliff_promoted_1to2')}, "
+                                    f"demoted={stats.get('cliff_demoted_1to2')})"
+                                )
+                            else:
+                                cliff = ""
+                            if det_c is True:
+                                det_seg = " | detection: CONSISTENT (cliff clean)"
+                            elif det_c is False:
+                                det_seg = " | detection: INCONSISTENT (cliff flip)"
+                            else:
+                                det_seg = ""
+                            logger.warning(
+                                "Inconsistent | max_diff=%.6f | cos=%.6f | "
+                                "cls_max_diff=%s%s%s",
+                                stats.get("max_diff"),
+                                stats.get("cosine_similarity"),
+                                ("%.2e" % stats["cls_max_diff"])
+                                if "cls_max_diff" in stats else "n/a",
+                                cliff,
+                                det_seg,
+                            )
+                            if copy_failed_samples:
+                                for p in pre["paths"]:
+                                    logger.warning("Failed image: %s", p)
+                                    try:
+                                        dst = fail_dir / f"{uuid.uuid4()}_{Path(p).name}"
+                                        shutil.copy(p, dst)
+                                    except Exception:
+                                        logger.exception("Failed to copy image")
+
+                    except Exception:
                         failures += 1
-                        logger.warning(
-                            "Inconsistent | max_diff=%.6f | cos=%.6f",
-                            stats.get("max_diff"),
-                            stats.get("cosine_similarity"),
-                        )
-                        if copy_failed_samples:
-                            for p in pre["paths"]:
-                                logger.warning("Failed image: %s", p)
-                                try:
-                                    dst = fail_dir / f"{uuid.uuid4()}_{Path(p).name}"
-                                    shutil.copy(p, dst)
-                                except Exception:
-                                    logger.exception("Failed to copy image")
+                        logger.exception("Batch processing failed")
 
-                except Exception:
-                    failures += 1
-                    logger.exception("Batch processing failed")
+                # Batches attempted for this config. Exception batches count toward
+                # ``failures`` but are not appended to ``batch_results``.
+                n_attempted = max(1, (len(imgs) + bs - 1) // bs) if imgs else 1
 
-            # Batches attempted for this config. Exception batches count toward
-            # ``failures`` but are not appended to ``batch_results``.
-            n_attempted = max(1, (len(imgs) + bs - 1) // bs) if imgs else 1
+                summary: Dict = {
+                    "imgsz": imgsz,
+                    "batch_size": bs,
+                    "total_batches": n_attempted,
+                    "failures": failures,
+                    "fail_rate": failures / n_attempted,
+                    # Conf-cliff (detection-level) failure count — tensor mode only;
+                    # 0 in detection mode.
+                    "detection_failures": detection_failures,
+                    "detection_fail_rate": detection_failures / n_attempted,
+                    "overall_status": "PASS" if failures == 0 else "FAIL",
+                    "detailed_results": batch_results,
+                }
 
-            summary: Dict = {
-                "imgsz": imgsz,
-                "batch_size": bs,
-                "total_batches": n_attempted,
-                "failures": failures,
-                "fail_rate": failures / n_attempted,
-                "overall_status": "PASS" if failures == 0 else "FAIL",
-                "detailed_results": batch_results,
-            }
+                for k in ("max_diff", "mean_diff", "p95", "p99",
+                          "std_diff", "cosine_similarity",
+                          "cls_max_diff", "cls_mean_diff", "cls_p99", "cls_cos",
+                          "above_cliff_1", "above_cliff_2",
+                          "cliff_promoted_1to2", "cliff_demoted_1to2"):
+                    vals = [s.get(k) for s in batch_results if k in s]
+                    if vals:
+                        summary[f"{k}_mean"] = float(np.mean(vals))
 
-            for k in ("max_diff", "mean_diff", "p95", "p99",
-                      "std_diff", "cosine_similarity"):
-                vals = [s.get(k) for s in batch_results if k in s]
-                if vals:
-                    summary[f"{k}_mean"] = float(np.mean(vals))
+                results.append(summary)
+                # Write incrementally so a crash mid-run keeps partial results.
+                atomic_json_dump({"results": results, "mode": mode}, report_path)
 
-            results.append(summary)
-            # Write incrementally so a crash mid-run keeps partial results.
-            atomic_json_dump({"results": results, "mode": mode}, report_path)
+                logger.info(
+                    "fail_rate=%.2f%% | detection_fail_rate=%.2f%%",
+                    summary["fail_rate"] * 100, summary["detection_fail_rate"] * 100,
+                )
 
-            logger.info("fail_rate=%.2f%%", summary["fail_rate"] * 100)
+    finally:
+        # A tensorrt: wrapper's .engine is deserialized lazily on the first
+        # forward; release both wrappers so its stream, device buffers, and
+        # primary context do not outlive the run (a no-op for the other
+        # backends and for wrappers that never ran a forward).
+        model_obj1.release()
+        model_obj2.release()
 
     overall_pass = all(r["overall_status"] == "PASS" for r in results)
     final_result = {"results": results, "overall_pass": overall_pass, "mode": mode}

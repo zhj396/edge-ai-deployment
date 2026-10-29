@@ -9,6 +9,7 @@ Subcommands
 * ``consistency`` — compare two models (tensor- or detection-level)
 * ``benchmark``   — latency / throughput / memory / mAP
 * ``openvino``    — OpenVINO IR convert / NNCF INT8 / run (optional dep)
+* ``tensorrt``    — TensorRT engine build / export / run (optional dep)
 
 All commands share the same top-level ``--log-level`` flag.
 """
@@ -16,7 +17,7 @@ import argparse
 import logging
 import sys
 
-from cli import benchmark, consistency, export, infer, inspect, openvino, quantize
+from cli import benchmark, consistency, export, infer, inspect, openvino, quantize, tensorrt
 from src import __version__ as PACKAGE_VERSION
 from utils import get_logger, setup_logging, suppress_third_party_logs
 
@@ -31,6 +32,7 @@ COMMANDS = {
     "consistency": consistency,
     "benchmark": benchmark,
     "openvino": openvino,
+    "tensorrt": tensorrt,
 }
 
 

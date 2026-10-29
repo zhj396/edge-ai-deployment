@@ -109,6 +109,28 @@ def _try_malloc_trim() -> None:
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
+# Upper bound on the kernel-only timing loop for the tensorrt* rows: it
+# re-runs the first batch on top of the end-to-end measurement, so it stays
+# short regardless of --runs.
+KERNEL_TIMED_RUNS_CAP = 25
+
+
+def _tensorrt_device_from_env() -> int:
+    """TRT GPU id from ``TENSORRT_DEVICE`` (default 0), with a pointed error.
+
+    Mirrors the ``OPENVINO_DEVICE`` posture: a malformed value raises a
+    ``ValueError`` naming the variable rather than a bare ``int()`` literal
+    error from deep inside the engine construction.
+    """
+    raw = os.environ.get("TENSORRT_DEVICE", "0")
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(
+            f"TENSORRT_DEVICE must be an int GPU id, got {raw!r}"
+        ) from None
+
+
 class Benchmark:
     """Latency / throughput / memory / mAP benchmark for YOLOv8s."""
 
@@ -280,6 +302,7 @@ class Benchmark:
             backend == "pytorch"
             or backend in ("onnx_fp32", "onnx_int8")
             or backend.startswith("openvino")
+            or backend.startswith("tensorrt")
         )
         if not supported:
             logger.warning(
@@ -289,7 +312,13 @@ class Benchmark:
             return None, "unsupported backend (no Python engine to drive)"
 
         from utils.map_eval import evaluate_map
-        from . import YOLOv8Engine, OpenVINOEngine, openvino_available
+        from . import (
+            YOLOv8Engine,
+            OpenVINOEngine,
+            openvino_available,
+            TensorRTEngine,
+            tensorrt_available,
+        )
 
         data_yaml = Path(self.imgs_input) / "data.yaml"
         logger.info("Computing mAP (native evaluator) for %s...", backend)
@@ -319,6 +348,24 @@ class Benchmark:
                 engine = OpenVINOEngine(
                     model_path=model_path, device=ov_device,
                     imgsz=self.imgsz, data_yaml=data_yaml,
+                )
+            elif backend.startswith("tensorrt"):
+                if not tensorrt_available():
+                    raise RuntimeError(
+                        "tensorrt is not installed. Run: "
+                        "pip install -r requirements-tensorrt.txt"
+                    )
+                # Device follows TENSORRT_DEVICE (default 0) — same posture
+                # as _run_tensorrt and the OPENVINO_DEVICE branch above
+                # (--device controls only where preprocessing runs). An
+                # inert pin (CUDA already initialized in this process) is
+                # detected and warned inside the engine constructor, which
+                # then lands on GPU 0 and reports the id through
+                # ``device_id``. max_batch = max(--batch-size, 8).
+                engine = TensorRTEngine(
+                    model_path=model_path, imgsz=self.imgsz,
+                    max_batch=max(self.batch_size, 8), data_yaml=data_yaml,
+                    device=_tensorrt_device_from_env(),
                 )
             # ort_cpp is a subprocess exe with no Python engine, so its row
             # skips the native evaluator.
@@ -606,6 +653,101 @@ class Benchmark:
             shutil.rmtree(tmp_in, ignore_errors=True)
             shutil.rmtree(out_dir, ignore_errors=True)
 
+    # tensorrt path
+    def _run_tensorrt(self, backend: str, model_path: str) -> Dict:
+        """TensorRT serialized engine via the Python backend (cuda-python)."""
+        from . import TensorRTEngine, tensorrt_available
+        return self._run_tensorrt_family(
+            backend, model_path, TensorRTEngine, tensorrt_available,
+            "tensorrt is not installed; run: "
+            "pip install -r requirements-tensorrt.txt",
+        )
+
+    def _run_tensorrt_family(
+        self, backend: str, model_path: str,
+        ctor, avail_fn, unavail_msg: str,
+    ) -> Dict:
+        """Shared timed-loop body for the TensorRT backends (``tensorrt*``).
+        The caller passes the constructor + availability predicate. Construct
+        once, feed the shared preprocess -> forward -> post_process pipeline,
+        then ``release()`` in ``finally``.
+
+        Two extra metrics are attached for these rows only:
+        ``kernel_latency_ms`` / ``kernel_fps`` — the GPU-side forward window
+        timed at stream sync (GPU work already retired before the timer
+        starts does not re-appear in it), free of Python NMS / letterbox /
+        disk I/O, via ``kernel_timed_forward`` (other rows leave the two
+        summary columns empty; the end-to-end latency/FPS columns stay
+        comparable across all rows).
+        """
+        baseline = self._baseline_memory()
+
+        if not avail_fn():
+            raise RuntimeError(unavail_msg)
+        # The requested TRT GPU id comes from TENSORRT_DEVICE (default 0),
+        # mirroring the OPENVINO_DEVICE pattern: --device still controls
+        # only where the preprocessing runs. The engine detects an inert
+        # pin (CUDA already initialized in this process) after cuInit,
+        # warns, and lands on GPU 0 — its ``device_id`` carries the id it
+        # actually executes on.
+        engine = ctor(
+            model_path=model_path, imgsz=self.imgsz,
+            max_batch=max(self.batch_size, 8),
+            device=_tensorrt_device_from_env(),
+        )
+        # Cap to the engine's effective max_batch (the serialized engine's
+        # optimization profile, 1 for a static engine).
+        eff = engine._effective_batch(self.batch_size)
+
+        batches = list(self._build_batches(self.speed_imgs, eff))
+        if not batches:
+            raise RuntimeError("No images available for benchmarking")
+
+        def forward(pre: Dict):
+            return engine._forward(pre["images"].cpu().numpy())
+
+        try:
+            metrics = self._timed_end_to_end(
+                backend, model_path, batches, forward, baseline
+            )
+            # Record the device the engine executes on (the TENSORRT_DEVICE
+            # pin is inert when CUDA was already initialized; the engine's
+            # post-cuInit visibility check catches that and lands on GPU 0)
+            # — --device controls only preprocessing.
+            metrics["device"] = f"cuda:{engine.device_id}"
+            # torch.cuda peak stats see none of the engine's cuda-python
+            # allocations, so Peak_Memory_MB understates these rows; the
+            # RSS_Increase_MB column carries the host-side figure.
+
+            # GPU-kernel-only timing — a short loop over the first batch,
+            # timed around the stream sync over the enqueued H2D+execute+D2H
+            # (no NMS / preprocess in the timed region). The end-to-end
+            # numbers above already include NMS.
+            pre0 = preprocess_imgs(batches[0], imgsz=self.imgsz, device="cpu")
+            _ = engine.kernel_timed_forward(pre0["images"].cpu().numpy())  # warm
+            k_ms = []
+            for _ in range(min(self.runs, KERNEL_TIMED_RUNS_CAP)):
+                _raw, ms = engine.kernel_timed_forward(
+                    pre0["images"].cpu().numpy()
+                )
+                k_ms.append(ms)
+            metrics["kernel_latency_ms"] = float(np.mean(k_ms))
+            metrics["kernel_fps"] = (
+                1000.0 / metrics["kernel_latency_ms"]
+                if metrics["kernel_latency_ms"] > 0 else 0.0
+            )
+            logger.info(
+                "%s | kernel=%.2fms | kernel_fps=%.1f (GPU forward only, no NMS)",
+                backend, metrics["kernel_latency_ms"], metrics["kernel_fps"],
+            )
+        finally:
+            engine.release()
+
+        if eff != self.batch_size:
+            metrics["requested_batch_size"] = self.batch_size
+            metrics["batch_size"] = eff
+        return metrics
+
     def _timed_end_to_end(
         self,
         backend: str,
@@ -762,6 +904,8 @@ class Benchmark:
                     speed = self._run_ort_cpp(backend, model_path)
                 elif backend.startswith("openvino"):
                     speed = self._run_openvino(backend, model_path)
+                elif backend.startswith("tensorrt"):
+                    speed = self._run_tensorrt(backend, model_path)
                 else:
                     speed = self._run_onnx(backend, model_path)
 
@@ -805,6 +949,8 @@ class Benchmark:
                 speed.get("p99", 0.0),
                 speed.get("peak_memory_mb", 0.0),
                 speed.get("rss_increase_mb", 0.0),
+                speed.get("kernel_latency_ms", ""),
+                speed.get("kernel_fps", ""),
                 map50,
                 map5095,
                 map_source,
@@ -821,6 +967,7 @@ class Benchmark:
             "Model", "Backend", "Device", "BatchSize", "Total_s", "Batch_s",
             "Image_s", "FPS", "Latency_ms_mean", "p50_ms", "p90_ms", "p95_ms",
             "p99_ms", "Peak_Memory_MB", "RSS_Increase_MB",
+            "Kernel_latency_ms", "Kernel_fps",
             "mAP50", "mAP50-95", "mAP_source",
         ])
 
