@@ -190,6 +190,11 @@ class ModelWrapper:
     # (the _trt_cpp module; mirrors benchmark's trt_cpp* labels).
     TRT_CPP_PREFIX = "trt_cpp:"
 
+    # Backend selector for the on-device QNN (Qualcomm HTP) backend: the path
+    # is the context binary (`.serialized.bin`) pushed to the device and
+    # executed through qnn-net-run over adb (see src/qnn_engine.py).
+    QNN_PREFIX = "qnn:"
+
     def __init__(self, model_path: str, device: str) -> None:
         spec = str(model_path)
         self.device = (
@@ -234,6 +239,16 @@ class ModelWrapper:
             # tensor ``x`` like the Python tensorrt: path.
             self.type = "trt_cpp"
             self.path = spec[len(self.TRT_CPP_PREFIX):]
+            self.model_path = self.path
+            self.model = None
+            return
+        if spec.startswith(self.QNN_PREFIX):
+            # On-device QNN (HTP) backend: the path is the context binary.
+            # Construction only resolves the runner object (host toolchain +
+            # adb are probed then); the device-side execution happens per
+            # forward call — see src/qnn_engine.py.
+            self.type = "qnn"
+            self.path = spec[len(self.QNN_PREFIX):]
             self.model_path = self.path
             self.model = None
             return
@@ -375,6 +390,21 @@ class ModelWrapper:
             # Python tensorrt: cap), so the count is capped and sub-looped
             # here like the tensorrt: path above.
             return trt_forward_capped(self.model, x.detach().cpu().numpy())
+        if self.type == "qnn":
+            # On-device QNN (HTP) backend: the runner is constructed on the
+            # first forward (host toolchain + adb probed then — the same
+            # lazy contract as ort_cpp:/tensorrt:/trt_cpp:), then the batch
+            # is NHWC-staged, executed on the device, and the split outputs
+            # are re-assembled channel-first. Consumes the
+            # already-preprocessed tensor ``x`` (the preprocess runs on this
+            # host; only the forward is on-device).
+            if self.model is None:
+                from . import QNNEngineRunner
+                self.model = QNNEngineRunner(
+                    model_path=self.model_path, imgsz=imgsz or 640,
+                )
+            return self.model.forward_batch(x.detach().cpu().numpy(),
+                                            self.model_path)
         if self.type == "openvino":
             # OpenVINO consumes host numpy: the torch CUDA tensor is copied
             # to host before the forward (a --device cuda run with an
@@ -397,7 +427,7 @@ class ModelWrapper:
         resources release through GC or process exit, and OpenVINO holds no
         explicit device handles.
         """
-        if self.type in ("tensorrt", "trt_cpp") and self.model is not None:
+        if self.type in ("tensorrt", "trt_cpp", "qnn") and self.model is not None:
             release = getattr(self.model, "release", None)
             if callable(release):
                 release()

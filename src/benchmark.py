@@ -450,8 +450,10 @@ class Benchmark:
                     max_batch=max(self.batch_size, 8), data_yaml=data_yaml,
                     device=_tensorrt_device_from_env(),
                 )
-            # ort_cpp is a subprocess exe with no Python engine, so its row
-            # skips the native evaluator.
+            # ort_cpp is a subprocess exe and the qnn* backends run their
+            # forward on a separate device — neither exposes a Python engine
+            # surface the native evaluator could drive, so those rows skip
+            # the evaluator.
             result = evaluate_map(
                 engine=engine,
                 data_yaml=data_yaml,
@@ -740,6 +742,91 @@ class Benchmark:
             shutil.rmtree(tmp_in, ignore_errors=True)
             shutil.rmtree(out_dir, ignore_errors=True)
 
+    # qnn path (on-device HTP via adb; the first cross-device rows)
+    def _run_qnn(self, backend: str, model_path: str) -> Dict:
+        """Qualcomm HTP context binary executed on the connected adb device.
+
+        The accelerator is on the device, not this host: the batch goes out
+        as NHWC raws over adb, one ``qnn-net-run`` invocation executes the
+        context binary, and the split (box / cls) raw outputs come back and
+        are re-assembled channel-first for the shared post_process / NMS.
+        ``warmup`` exercises the deployed path (stage → execute → NMS) once;
+        the timed loop covers the full round trip per run, so these rows
+        carry adb transfer + device execute + host NMS — a cross-device
+        protocol, not comparable per-millisecond with the same-host rows
+        (the ``device`` column carries the target SoC). The backend name
+        carries the quantization configuration (``qnn_w8a8`` /
+        ``qnn_w8a16``); there is no ``qnn_int8`` alias — the name states the
+        actual configuration (PTQ whole-net u8 activations, or W8A16 fp16
+        activations), not a QDQ artifact.
+
+        mAP ``--validation`` is skipped for these rows (the runner has no
+        ``infer()`` engine surface for the native evaluator; the precision
+        signal for the context binary is the consistency harness).
+        """
+        from . import QNNEngineRunner, qnn_available
+
+        if not qnn_available():
+            raise RuntimeError(
+                "QNN host toolchain unavailable. Set QNN_SDK_ROOT, install "
+                "platform-tools, connect the device and authorize USB "
+                "debugging. See docs/QNN.md."
+            )
+        n_images = len(self.speed_imgs)
+        if n_images == 0:
+            raise RuntimeError("No images available for benchmarking")
+
+        runner = QNNEngineRunner(
+            model_path=model_path, imgsz=self.imgsz,
+        )
+        batches = list(self._build_batches(self.speed_imgs, self.batch_size))
+        if not batches:
+            raise RuntimeError("No images available for benchmarking")
+
+        baseline = self._baseline_memory()
+
+        def forward(pre: Dict):
+            return runner.forward_batch(pre["images"].cpu().numpy(), model_path)
+
+        device_desc = runner.describe_device()
+        # Warmup once through the real path (stage + device execute + NMS):
+        # the first qnn-net-run invocation on a device also pays the one-time
+        # CDSP / HTP power-up, which would otherwise land in run 0.
+        pre0 = preprocess_imgs(batches[0], imgsz=self.imgsz, device="cpu")
+        _ = forward(pre0)
+        post_process(
+            outputs=forward(pre0), orig_shapes=pre0["orig_shapes"],
+            conf_thres=self.speed_conf, iou_thres=self.speed_iou,
+            imgsz=self.imgsz, ratios=pre0["ratios"], pads=pre0["pads"],
+        )
+
+        per_run_ms: List[float] = []
+        for _ in range(self.runs):
+            t0 = time.perf_counter()
+            for bp in batches:
+                pre = preprocess_imgs(bp, imgsz=self.imgsz, device="cpu")
+                out = forward(pre)
+                post_process(
+                    outputs=out, orig_shapes=pre["orig_shapes"],
+                    conf_thres=self.speed_conf, iou_thres=self.speed_iou,
+                    imgsz=self.imgsz, ratios=pre["ratios"], pads=pre["pads"],
+                )
+            per_run_ms.append((time.perf_counter() - t0) * 1000.0)
+
+        metrics = self._aggregate_metrics(
+            backend, model_path, per_run_ms, len(batches),
+            self._peak_memory(baseline),
+        )
+        # Cross-device protocol: the executing hardware is the device's HTP,
+        # not this host's CPU/GPU — the CSV Device column names it (the
+        # --device flag only controls where the host-side preprocess runs).
+        metrics["device"] = device_desc
+        logger.info(
+            "%s | device=%s (cross-device protocol: adb transfer + device "
+            "execute + host NMS)", backend, device_desc,
+        )
+        return metrics
+
     # tensorrt path
     def _run_tensorrt(self, backend: str, model_path: str) -> Dict:
         """TensorRT serialized engine via the Python backend (cuda-python)."""
@@ -1019,6 +1106,8 @@ class Benchmark:
                     speed = self._run_tensorrt(backend, model_path)
                 elif backend.startswith("trt_cpp"):
                     speed = self._run_trt_cpp(backend, model_path)
+                elif backend in ("qnn_w8a8", "qnn_w8a16"):
+                    speed = self._run_qnn(backend, model_path)
                 else:
                     speed = self._run_onnx(backend, model_path)
 

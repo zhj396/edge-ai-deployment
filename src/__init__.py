@@ -53,6 +53,9 @@ _LAZY: dict[str, str] = {
     # _trt_cpp module built behind BUILD_TRT_CPP, requires TRT + CUDA + pybind11)
     "TensorRTEngineCpp": ".tensorrt_cpp_engine",
     "trt_cpp_available": ".tensorrt_cpp_engine",
+    # QNN backend (optional — QAIRT SDK + adb device; on-device HTP execution)
+    "QNNEngineRunner": ".qnn_engine",
+    "qnn_available": ".qnn_engine",
 }
 
 __all__ = list(_LAZY)

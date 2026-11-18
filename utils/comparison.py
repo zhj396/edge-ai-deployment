@@ -28,7 +28,8 @@ TOLERANCE_PAIRS: Dict[str, Tuple[float, float]] = {
 REDUCED_PRECISION_MARKERS = ("int8", "int4", "fp16", "f16", "half", "quant")
 # The backend prefixes ModelWrapper parses (mirror of the class constants in
 # src/consistency.py — kept as a literal so this module stays import-light).
-_BACKEND_PREFIXES = ("openvino_int8:", "openvino:", "ort_cpp:", "tensorrt:")
+_BACKEND_PREFIXES = ("openvino_int8:", "openvino:", "ort_cpp:", "tensorrt:",
+                     "trt_cpp:", "qnn:")
 # Suffixes a full-precision artifact can carry. .xml (OpenVINO IR — FP16 by
 # default at convert time) and .engine (TensorRT) are deliberately absent.
 _FULL_PRECISION_SUFFIXES = (".pt", ".pth", ".onnx")

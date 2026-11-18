@@ -47,6 +47,10 @@ def add_parser(subparsers):
             "--model trt_cpp_fp16:models/yolov8s_fp16.engine "
             "(the SAME .engine via the in-process C++ pybind11 backend — build "
             "the module with `cmake --build cpp/build --target _trt_cpp`) "
+            "--model qnn_w8a8:models/yolov8s_w8a8.serialized.bin "
+            "--model qnn_w8a16:models/yolov8s_w8a16.serialized.bin "
+            "(Qualcomm HTP context binaries executed on the connected adb "
+            "device; see docs/QNN.md) "
             "--model openvino:models/yolov8s_openvino.xml "
             "--model openvino_int8:models/yolov8s_openvino_int8.xml "
             "(openvino device is selected via the OPENVINO_DEVICE env var)"
@@ -118,7 +122,8 @@ def run(args):
             if backend not in ["pytorch", "onnx_fp32", "onnx_int8", "ort_cpp",
                                "openvino", "openvino_int8",
                                "tensorrt", "tensorrt_fp16", "tensorrt_int8",
-                               "trt_cpp", "trt_cpp_fp16", "trt_cpp_int8"]:
+                               "trt_cpp", "trt_cpp_fp16", "trt_cpp_int8",
+                               "qnn_w8a8", "qnn_w8a16"]:
                 # A bare Windows path ("C:\models\x.onnx") partitions into
                 # backend="C", which falls through to the generic
                 # invalid-format message.

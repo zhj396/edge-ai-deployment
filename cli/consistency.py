@@ -19,15 +19,15 @@ def _resolve_consistency_model(arg, default):
     """Resolve a --model1/--model2 arg, allowing a backend prefix.
 
     A prefixed spec (``ort_cpp:<onnx>`` / ``tensorrt:<engine>`` /
-    ``trt_cpp:<engine>`` / ``openvino(_int8):<xml>``) is a backend selector,
-    not a path — pass it through verbatim; ``ModelWrapper`` parses the prefix.
-    ort_cpp/tensorrt/trt_cpp resolve their engine lazily on the first
-    forward; openvino(_int8) path-checks the .xml at construction. A plain
-    value is passed through unchanged; the existing-validated default applies
-    only when the flag is omitted.
+    ``trt_cpp:<engine>`` / ``qnn:<ctx>`` / ``openvino(_int8):<xml>``) is a
+    backend selector, not a path — pass it through verbatim; ``ModelWrapper``
+    parses the prefix. ort_cpp/tensorrt/trt_cpp/qnn resolve their engine
+    lazily on the first forward; openvino(_int8) path-checks the .xml at
+    construction. A plain value is passed through unchanged; the
+    existing-validated default applies only when the flag is omitted.
     """
     if arg and str(arg).startswith(
-        ("ort_cpp:", "tensorrt:", "trt_cpp:", "openvino:", "openvino_int8:")
+        ("ort_cpp:", "tensorrt:", "trt_cpp:", "qnn:", "openvino:", "openvino_int8:")
     ):
         return arg
     return arg if arg is not None else existing_validation(default)
@@ -58,7 +58,10 @@ def add_parser(subparsers):
         f"via the TensorRT backend, e.g. "
         f"'tensorrt:models/yolov8s_fp16.engine'. Prefix 'trt_cpp:' to compare "
         f"the SAME .engine via the in-process C++ pybind11 backend (build it: "
-        f"cmake --build cpp/build --target _trt_cpp). Prefix 'openvino:' or "
+        f"cmake --build cpp/build --target _trt_cpp). Prefix 'qnn:' to compare "
+        f"a Qualcomm HTP context binary executed on the connected adb device "
+        f"(see docs/QNN.md), e.g. 'qnn:models/yolov8s_w8a16.serialized.bin'. "
+        f"Prefix 'openvino:' or "
         f"'openvino_int8:' to compare an OpenVINO IR, e.g. "
         f"'openvino_int8:models/yolov8s_openvino_int8.xml' "
         f"(OPENVINO_DEVICE env var selects CPU/GPU/AUTO).",
@@ -66,7 +69,7 @@ def add_parser(subparsers):
     parser.add_argument(
         "--model2", type=str, default=None,
         help=f"Comparison model (default: {DEFAULT_MODEL_FP32}). Accepts the "
-        f"'ort_cpp:', 'tensorrt:', 'trt_cpp:', 'openvino:' and "
+        f"'ort_cpp:', 'tensorrt:', 'trt_cpp:', 'qnn:', 'openvino:' and "
         f"'openvino_int8:' prefixes like --model1.",
     )
     parser.add_argument(
