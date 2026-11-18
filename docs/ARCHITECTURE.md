@@ -807,6 +807,55 @@ engine builds, so flip sets are not expected to coincide).
 
 ---
 
+### 11.3 QNN HTP (recorded on the AR1+ SAR2130P, on-device)
+
+> Recorded on the AR1+ smart-glasses SoC (SAR2130P / Aliso SG2, Hexagon HTP v73, VTCM 2 MB):
+> QNN v2.42.0.251225 device userspace = host SDK (sha256-matched `libQnnHtp.so` /
+> `libQnnHtpV73Stub.so` / `libQnnHtpV73Skel.so`), Android 14 userdebug builds
+> `UKQ1.260430.001/890` + `/1177` (both recorded; the context binary and the numbers are
+> build-independent). Static batch 1, 1x3x640x640, 8 calibration images (seed-42 sampler,
+> NHWC raws). Latency from `qnn-net-run --profiling_level detailed` parsed by
+> `qnn-profile-viewer`; the accelerator average includes first-inference VTCM/HVX power-up
+> (kernel cycles stable at +-0.1%). The backend is the toolchain first cross-device surface
+> (adb transfer + device execute + host NMS) — the per-millisecond rows are a different
+> protocol from the same-host tables above and are not comparable per-millisecond with them.
+> Conversion pipeline, the two graph-layout contracts (NHWC inputs, split box/cls outputs),
+> the host-compiler blockers, and the full command surface live in [docs/QNN.md](QNN.md).
+
+| configuration | accelerator execute (avg) | cycles | NetRun e2e (avg) |
+|---|---|---|---|
+| W8A8 PTQ, default perf mode | 34.6 ms | 19.63M | 41.0 ms |
+| W8A8 PTQ, burst perf mode | **17.3 ms** | — | 20.1 ms |
+| W8A16 PTQ, default perf mode | 64.5 ms | — | 71.8 ms |
+| W8A16 PTQ, burst perf mode | unmeasured — board resets (see below) | — | — |
+
+Consistency vs the canonical ORT FP32 ONNX on the formal gate set (the 20-image consistency
+request resolves to 16 images through the sampler farthest-first trim; `compare_tensors` at
+the deployed conf 0.25, bs=1 3-D tensors — the shape the nc-split activates on; the output
+raws score channel-first and the input raws stage NHWC — both measured, see docs/QNN.md):
+
+| pair | tensor `fail_rate` | conf-cliff `detection_fail_rate` | signature |
+|---|---|---|---|
+| FP32-ONNX <-> qnn W8A8 (auto-loose) | 100% | 12.5% (2/16) | box corr 0.9985, cls corr 0.9857; flips img8 46->37 (d9) + img12 12->2 (d10) |
+| FP32-ONNX <-> qnn W8A16 (auto-loose) | 100% | 6.25% (1/16) | box corr 0.9996, cls corr 0.9910; flip img12 12->2 (d10) |
+
+Readings that carry beyond this table: the raw `allclose` 100% is the structural
+reduced-precision reading (dual verdict, quoted as a pair — the same contract as the ORT
+QDQ-INT8 row). The single-output PTQ route collapses the cls branch to exactly 0.0 (one
+per-tensor encoding dominated by the 0-640 box range leaves the sigmoid scores below 1 LSB);
+the shipped route names two outputs (`/model.22/Mul_5_output_0` + `/model.22/Sigmoid_output_0`),
+each with its own encoding, and the collapse is gone (cls corr >= 0.9857 on the formal set).
+At 16 images both configurations cross the 5/img cliff-flip gate on isolated hard images —
+the same image (img12) flips under both, W8A8 additionally on img8 — while box correlation
+holds at 0.9985/0.9996 and W8A16 stays cleaner on both the cls band and the flip count.
+The W8A16 x burst combination hard-resets the board (three independent reproductions across
+builds and power setups — adb drops at context load, `bootreason=reboot`, empty pstore, no
+vreg/thermal kernel traces; a PMIC-level power drop). W8A8 x burst and W8A16 x default are
+both stable, so the trigger is the combination — the W8A16 burst cell is unmeasured by
+design, and the power x precision-config joint envelope is itself the recorded finding.
+
+---
+
 ## 12. Operating instructions
 
 See the [README Quick Start](../README.md#quick-start) for the full command sequence (export →
